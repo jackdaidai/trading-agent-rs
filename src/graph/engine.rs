@@ -246,11 +246,13 @@ impl GraphEngine {
         let mut debate_state = InvestDebateState::default();
         let max_rounds = self.config.max_debate_rounds;
 
-        // Run debate rounds
+        // Run debate rounds (bull & bear argue in parallel)
         for round in 0..max_rounds {
             tracing::info!("Bull/Bear debate round {}", round + 1);
 
-            // Bull makes argument
+            let prior_history = debate_state.history.clone();
+
+            // Bull and Bear argue independently in parallel
             let bull_prompt = format!(
                 r#"You are a bullish researcher arguing FOR investing in {company}.
 
@@ -261,26 +263,23 @@ impl GraphEngine {
                 Fundamentals: {fundamentals}
 
                 {memory_context}
+                {prior}
 
                 Provide your bullish argument focusing on:
                 - Growth catalysts
                 - Competitive advantages
                 - Positive indicators
 
-                Format: Start with "Bull:" and make your case.
+                Format: Start with "Bull:" and make your case concisely (max 300 words).
                 "#,
                 company = state.company_of_interest,
                 market = state.market_report,
                 sentiment = state.sentiment_report,
                 news = state.news_report,
                 fundamentals = state.fundamentals_report,
+                prior = if prior_history.is_empty() { String::new() } else { format!("Prior debate:\n{}", prior_history) },
             );
 
-            let bull_response = self.llm_quick.complete(&bull_prompt).await?;
-            debate_state.bull_history.push_str(&format!("\nBull: {}", bull_response));
-            debate_state.current_response = bull_response.clone();
-
-            // Bear makes argument
             let bear_prompt = format!(
                 r#"You are a bearish researcher arguing AGAINST investing in {company}.
 
@@ -291,25 +290,29 @@ impl GraphEngine {
                 Fundamentals: {fundamentals}
 
                 {memory_context}
-
-                Bull's argument: {bull_response}
+                {prior}
 
                 Provide your bearish counter-argument focusing on:
                 - Risks and challenges
                 - Negative indicators
-                - Why the bull case is flawed
+                - Overvaluation concerns
 
-                Format: Start with "Bear:" and make your case.
+                Format: Start with "Bear:" and make your case concisely (max 300 words).
                 "#,
                 company = state.company_of_interest,
                 market = state.market_report,
                 sentiment = state.sentiment_report,
                 news = state.news_report,
                 fundamentals = state.fundamentals_report,
-                bull_response = bull_response,
+                prior = if prior_history.is_empty() { String::new() } else { format!("Prior debate:\n{}", prior_history) },
             );
 
-            let bear_response = self.llm_quick.complete(&bear_prompt).await?;
+            let (bull_response, bear_response) = tokio::try_join!(
+                self.llm_quick.complete(&bull_prompt),
+                self.llm_quick.complete(&bear_prompt),
+            )?;
+
+            debate_state.bull_history.push_str(&format!("\nBull: {}", bull_response));
             debate_state.bear_history.push_str(&format!("\nBear: {}", bear_response));
             debate_state.history.push_str(&format!("Round {} Bull: {} Bear: {}", round + 1, bull_response, bear_response));
             debate_state.current_response = bear_response;
@@ -411,9 +414,9 @@ impl GraphEngine {
 
             // Run all 3 risk analysts in parallel
             let (agg_result, cons_result, neut_result) = tokio::join!(
-                self.run_aggressive_risk(&state),
-                self.run_conservative_risk(&state),
-                self.run_neutral_risk(&state),
+                self.run_aggressive_risk(state),
+                self.run_conservative_risk(state),
+                self.run_neutral_risk(state),
             );
 
             // Extract string values before ? moves them
@@ -454,7 +457,7 @@ impl GraphEngine {
             - Why risk is worth taking
             - Position sizing for maximum gains
 
-            Format: Start with "Aggressive:" and state your position.
+            Format: Start with "Aggressive:" and state your position concisely (max 300 words).
             "#,
             trader_plan = state.trader_investment_plan,
             market = state.market_report,
@@ -479,7 +482,7 @@ impl GraphEngine {
             - Volatility concerns
             - Risk mitigation strategies
 
-            Format: Start with "Conservative:" and state your position.
+            Format: Start with "Conservative:" and state your position concisely (max 300 words).
             "#,
             trader_plan = state.trader_investment_plan,
             market = state.market_report,
@@ -495,19 +498,20 @@ impl GraphEngine {
 
             Trader's plan: {trader_plan}
 
-            Aggressive view: {agg}
-            Conservative view: {cons}
+            Analyst reports:
+            Market: {market}
+            Fundamentals: {fundamentals}
 
             Provide your balanced risk assessment:
-            - Weighing both sides
+            - Weighing upside potential vs downside risk
             - Moderate position sizing
             - Key risk metrics to monitor
 
-            Format: Start with "Neutral:" and state your position.
+            Format: Start with "Neutral:" and state your position concisely (max 300 words).
             "#,
             trader_plan = state.trader_investment_plan,
-            agg = state.risk_debate_state.current_aggressive_response,
-            cons = state.risk_debate_state.current_conservative_response,
+            market = state.market_report,
+            fundamentals = state.fundamentals_report,
         );
 
         self.llm_quick.complete(&prompt).await

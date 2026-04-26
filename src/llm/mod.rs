@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use anyhow::{Result, Context};
+use std::time::Duration;
 
 
 /// Tool definition for LLM tool calling
@@ -62,7 +63,10 @@ impl OpenAIClient {
             model: model.to_string(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 }
@@ -111,17 +115,15 @@ impl LLMClient for OpenAIClient {
             .to_string();
 
         // Extract tool calls if present
-        let tool_calls = if let Some(tc) = resp_json["choices"][0]["message"]["tool_calls"].as_array() {
-            Some(tc.iter().map(|t| {
+        let tool_calls = resp_json["choices"][0]["message"]["tool_calls"].as_array().map(|tc| {
+            tc.iter().map(|t| {
                 let args: Value = serde_json::from_str(t["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
                 ToolCall {
                     name: t["function"]["name"].as_str().unwrap_or("").to_string(),
                     arguments: args,
                 }
-            }).collect())
-        } else {
-            None
-        };
+            }).collect()
+        });
 
         Ok(LLMResponse {
             content,
@@ -156,7 +158,10 @@ impl AnthropicClient {
             model: model.to_string(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 }

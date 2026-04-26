@@ -146,7 +146,7 @@ impl BM25Memory {
         scores.iter()
             .take(n_matches)
             .map(|(idx, score)| {
-                let normalized_score = (score / 10.0).min(1.0).max(0.0);
+                let normalized_score = (score / 10.0).clamp(0.0, 1.0);
                 MemoryMatch {
                     matched_situation: self.documents[*idx].clone(),
                     recommendation: self.recommendations[*idx].clone(),

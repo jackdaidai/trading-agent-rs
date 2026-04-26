@@ -28,7 +28,7 @@ pub struct RiskDebateState {
 }
 
 /// Main agent state - the state machine flows through this
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentState {
     pub company_of_interest: String,
     pub trade_date: String,
@@ -60,26 +60,6 @@ pub struct AgentState {
 pub struct Message {
     pub role: String,
     pub content: String,
-}
-
-impl Default for AgentState {
-    fn default() -> Self {
-        Self {
-            company_of_interest: String::new(),
-            trade_date: String::new(),
-            sender: String::new(),
-            market_report: String::new(),
-            sentiment_report: String::new(),
-            news_report: String::new(),
-            fundamentals_report: String::new(),
-            investment_debate_state: InvestDebateState::default(),
-            investment_plan: String::new(),
-            trader_investment_plan: String::new(),
-            risk_debate_state: RiskDebateState::default(),
-            final_trade_decision: String::new(),
-            messages: Vec::new(),
-        }
-    }
 }
 
 impl AgentState {

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 /// Type-safe tool names — adding a variant here without handling it in
 /// `execute_tool` will produce a compile error (non-exhaustive match).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::enum_variant_names)]
 pub enum ToolName {
     GetStockData,
     GetIndicators,
