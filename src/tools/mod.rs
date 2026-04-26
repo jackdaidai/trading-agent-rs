@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Tool registry and invocation system
 //!
 //! Tools are defined here and routed to vendor implementations (yfinance, alpha_vantage)
@@ -5,7 +6,68 @@
 use crate::llm::Tool;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use anyhow::{Result, Context};
+
+
+/// Type-safe tool names — adding a variant here without handling it in
+/// `execute_tool` will produce a compile error (non-exhaustive match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolName {
+    GetStockData,
+    GetIndicators,
+    GetFundamentals,
+    GetBalanceSheet,
+    GetCashflow,
+    GetIncomeStatement,
+    GetNews,
+    GetGlobalNews,
+    GetInsiderTransactions,
+}
+
+impl ToolName {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::GetStockData => "get_stock_data",
+            Self::GetIndicators => "get_indicators",
+            Self::GetFundamentals => "get_fundamentals",
+            Self::GetBalanceSheet => "get_balance_sheet",
+            Self::GetCashflow => "get_cashflow",
+            Self::GetIncomeStatement => "get_income_statement",
+            Self::GetNews => "get_news",
+            Self::GetGlobalNews => "get_global_news",
+            Self::GetInsiderTransactions => "get_insider_transactions",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "get_stock_data" => Some(Self::GetStockData),
+            "get_indicators" => Some(Self::GetIndicators),
+            "get_fundamentals" => Some(Self::GetFundamentals),
+            "get_balance_sheet" => Some(Self::GetBalanceSheet),
+            "get_cashflow" => Some(Self::GetCashflow),
+            "get_income_statement" => Some(Self::GetIncomeStatement),
+            "get_news" => Some(Self::GetNews),
+            "get_global_news" => Some(Self::GetGlobalNews),
+            "get_insider_transactions" => Some(Self::GetInsiderTransactions),
+            _ => None,
+        }
+    }
+
+    /// All variants, used to generate tool definitions.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::GetStockData,
+            Self::GetIndicators,
+            Self::GetFundamentals,
+            Self::GetBalanceSheet,
+            Self::GetCashflow,
+            Self::GetIncomeStatement,
+            Self::GetNews,
+            Self::GetGlobalNews,
+            Self::GetInsiderTransactions,
+        ]
+    }
+}
 
 /// All available tools in the system
 pub fn get_all_tools() -> Vec<Tool> {
@@ -146,6 +208,14 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<&Tool> {
         self.tools.get(name)
+    }
+
+    /// Get a tool by its typed name. Panics only if the registry wasn't populated
+    /// with all tools (a programmer error, not user input).
+    pub fn get_by_name(&self, name: ToolName) -> Tool {
+        self.tools.get(name.as_str())
+            .cloned()
+            .expect("ToolRegistry missing a registered tool — this is a bug")
     }
 
     pub fn all(&self) -> Vec<Tool> {

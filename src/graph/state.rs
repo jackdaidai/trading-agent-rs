@@ -1,8 +1,6 @@
 //! Agent state structures - mirrors Python TradingAgents state
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
 /// Investment debate state (bull/bear researchers)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InvestDebateState {
@@ -110,11 +108,13 @@ impl AgentState {
 
 /// State update returned by node execution
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct StateUpdate {
     pub field: String,
     pub value: String,
 }
 
+#[allow(dead_code)]
 impl StateUpdate {
     pub fn set(field: &str, value: &str) -> Self {
         Self {

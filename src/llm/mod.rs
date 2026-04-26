@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use anyhow::{Result, Context};
-use std::collections::HashMap;
+
 
 /// Tool definition for LLM tool calling
 #[derive(Debug, Clone)]
@@ -18,6 +18,7 @@ pub struct Tool {
 pub struct LLMResponse {
     pub content: String,
     pub tool_calls: Option<Vec<ToolCall>>,
+    #[allow(dead_code)]
     pub reasoning: Option<String>,
 }
 
@@ -40,6 +41,7 @@ pub trait LLMClient: Send + Sync {
     fn validate_model(&self) -> bool;
 
     /// Provider name for logging
+    #[allow(dead_code)]
     fn provider_name(&self) -> &str;
 }
 

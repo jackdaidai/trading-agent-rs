@@ -32,6 +32,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "sk-...".to_string());
     let base_url = std::env::var("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string());
+    let quick_model = std::env::var("TAGENT_QUICK_MODEL")
+        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let deep_model = std::env::var("TAGENT_DEEP_MODEL")
+        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
 
     tracing::info!("Initializing TAgent...");
 
@@ -39,14 +43,14 @@ async fn main() -> Result<()> {
     // Using MiniMax's Anthropic-compatible endpoint (same as Python version)
     let llm_quick = Arc::new(AnyLLMClient::new(
         "anthropic",
-        "claude-sonnet-4-6",
+        &quick_model,
         &api_key,
         &base_url,
     ));
 
     let llm_deep = Arc::new(AnyLLMClient::new(
         "anthropic",
-        "claude-sonnet-4-6",
+        &deep_model,
         &api_key,
         &base_url,
     ));
@@ -61,6 +65,8 @@ async fn main() -> Result<()> {
 
     // Create graph engine
     let config = GraphConfig {
+        company: String::new(),
+        trade_date: String::new(),
         max_debate_rounds: 1,
         max_risk_discuss_rounds: 1,
         max_recur_limit: 100,
@@ -92,7 +98,7 @@ async fn main() -> Result<()> {
     println!("\n[Completed in {:.0}s]", elapsed.as_secs_f64());
 
     // Save decision to memory
-    let memory_entry = (
+    let _memory_entry = (
         result.situation_summary(),
         result.final_trade_decision.clone(),
     );

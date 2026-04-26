@@ -4,11 +4,11 @@
 //! It routes between nodes based on conditional logic and maintains state.
 
 use crate::graph::state::{AgentState, InvestDebateState, RiskDebateState};
-use crate::llm::{LLMClient, AnyLLMClient, Tool};
+use crate::llm::{LLMClient, Tool};
 use crate::memory::BM25Memory;
-use crate::tools::{ToolRegistry, ToolCall};
-use crate::data::yfinance;
-use anyhow::{Result, Context};
+use crate::tools::{ToolRegistry, ToolName};
+use crate::data::yfinance::{self, YahooFinanceClient};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -19,15 +19,23 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct GraphConfig {
-    pub max_debate_rounds: i32,
-    pub max_risk_discuss_rounds: i32,
+    #[allow(dead_code)]
+    pub company: String,
+    #[allow(dead_code)]
+    pub trade_date: String,
+    pub max_debate_rounds: usize,
+    pub max_risk_discuss_rounds: usize,
+    #[allow(dead_code)]
     pub max_recur_limit: usize,
+    #[allow(dead_code)]
     pub output_language: String,
 }
 
 impl Default for GraphConfig {
     fn default() -> Self {
         Self {
+            company: String::new(),
+            trade_date: String::new(),
             max_debate_rounds: 1,
             max_risk_discuss_rounds: 1,
             max_recur_limit: 100,
@@ -45,6 +53,7 @@ pub struct GraphEngine {
     llm_quick: Arc<dyn LLMClient>,
     llm_deep: Arc<dyn LLMClient>,
     tool_registry: ToolRegistry,
+    yfinance: YahooFinanceClient,
     bull_memory: RwLock<BM25Memory>,
     bear_memory: RwLock<BM25Memory>,
     trader_memory: RwLock<BM25Memory>,
@@ -61,6 +70,7 @@ impl GraphEngine {
             llm_quick,
             llm_deep,
             tool_registry: ToolRegistry::new(),
+            yfinance: YahooFinanceClient::new(),
             bull_memory: RwLock::new(BM25Memory::new("bull")),
             bear_memory: RwLock::new(BM25Memory::new("bear")),
             trader_memory: RwLock::new(BM25Memory::new("trader")),
@@ -148,8 +158,8 @@ impl GraphEngine {
         );
 
         let tools = vec![
-            self.tool_registry.get("get_stock_data").cloned().unwrap(),
-            self.tool_registry.get("get_indicators").cloned().unwrap(),
+            self.tool_registry.get_by_name(ToolName::GetStockData),
+            self.tool_registry.get_by_name(ToolName::GetIndicators),
         ];
 
         self.execute_llm_with_tools(&prompt, &tools).await
@@ -170,7 +180,7 @@ impl GraphEngine {
             End with: FINAL SENTIMENT ANALYSIS: **POSITIVE/NEGATIVE/NEUTRAL**"#
         );
 
-        let tools = vec![self.tool_registry.get("get_news").cloned().unwrap()];
+        let tools = vec![self.tool_registry.get_by_name(ToolName::GetNews)];
 
         self.execute_llm_with_tools(&prompt, &tools).await
     }
@@ -190,8 +200,8 @@ impl GraphEngine {
         );
 
         let tools = vec![
-            self.tool_registry.get("get_news").cloned().unwrap(),
-            self.tool_registry.get("get_global_news").cloned().unwrap(),
+            self.tool_registry.get_by_name(ToolName::GetNews),
+            self.tool_registry.get_by_name(ToolName::GetGlobalNews),
         ];
 
         self.execute_llm_with_tools(&prompt, &tools).await
@@ -212,7 +222,7 @@ impl GraphEngine {
             End with: FINAL FUNDAMENTALS ANALYSIS: **STRONG/WEAK/FAIR**"#
         );
 
-        let tools = vec![self.tool_registry.get("get_fundamentals").cloned().unwrap()];
+        let tools = vec![self.tool_registry.get_by_name(ToolName::GetFundamentals)];
 
         self.execute_llm_with_tools(&prompt, &tools).await
     }
@@ -548,7 +558,7 @@ impl GraphEngine {
 
             for tc in tool_calls {
                 tracing::info!("Executing tool: {}", tc.name);
-                match yfinance::execute_tool(&tc.name, &tc.arguments).await {
+                match yfinance::execute_tool(&tc.name, &tc.arguments, &self.yfinance).await {
                     Ok(result) => tool_results.push(format!("Tool {} result: {}", tc.name, result)),
                     Err(e) => tool_results.push(format!("Tool {} error: {}", tc.name, e)),
                 }

@@ -1,13 +1,27 @@
+#![allow(dead_code)]
 //! BM25 memory system for tracking past trading situations and lessons
 
+use once_cell::sync::Lazy;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
+
+static WORD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[a-zA-Z0-9]+\b").unwrap());
 
 /// A stored memory entry with situation and recommendation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct MemoryEntry {
     pub situation: String,
     pub recommendation: String,
+}
+
+/// On-disk format — only raw data, IDF/tokens recomputed on load
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct MemoryStore {
+    entries: Vec<MemoryEntry>,
 }
 
 /// BM25-based memory system
@@ -34,10 +48,40 @@ impl BM25Memory {
         }
     }
 
+    /// Load from a JSON file, or create empty if file doesn't exist / is invalid.
+    pub fn from_file(name: &str, path: &Path) -> Self {
+        let mut mem = Self::new(name);
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(store) = serde_json::from_str::<MemoryStore>(&data) {
+                for entry in store.entries {
+                    mem.add(&entry.situation, &entry.recommendation);
+                }
+            }
+        }
+        mem
+    }
+
+    /// Persist current entries to a JSON file.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let store = MemoryStore {
+            entries: self.documents.iter().zip(self.recommendations.iter())
+                .map(|(s, r)| MemoryEntry {
+                    situation: s.clone(),
+                    recommendation: r.clone(),
+                })
+                .collect(),
+        };
+        let json = serde_json::to_string_pretty(&store)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
     /// Tokenize text into words (simple ASCII tokenizer)
     fn tokenize(&self, text: &str) -> Vec<String> {
-        let re = Regex::new(r"\b[a-zA-Z0-9]+\b").unwrap();
-        re.find_iter(text)
+        WORD_RE.find_iter(text)
             .map(|m| m.as_str().to_lowercase())
             .collect()
     }
@@ -72,8 +116,8 @@ impl BM25Memory {
 
         self.idf = df.iter()
             .map(|(term, &df)| {
-                let idf = (n - df + 0.5) / (df + 0.5);
-                (term.clone(), idf.ln())
+                let idf = ((n - df + 0.5) / (df + 0.5)).max(1.0).ln();
+                (term.clone(), idf)
             })
             .collect();
 
@@ -164,8 +208,8 @@ mod tests {
     fn test_tokenize() {
         let mem = BM25Memory::new("test");
         let tokens = mem.tokenize("NVDA stock analysis for 2026-04-25");
-        assert!(tokens.contains(&"nvda"));
-        assert!(tokens.contains(&"stock"));
+        assert!(tokens.contains(&"nvda".to_string()));
+        assert!(tokens.contains(&"stock".to_string()));
     }
 
     #[test]
@@ -178,5 +222,83 @@ mod tests {
         let results = mem.get_memories("NVDA earnings beat", 2);
         assert_eq!(results.len(), 2);
         assert!(results[0].similarity_score > 0.0);
+    }
+
+    #[test]
+    fn test_empty_memory_returns_empty() {
+        let mem = BM25Memory::new("test");
+        let results = mem.get_memories("anything", 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_empty_query_returns_empty() {
+        let mut mem = BM25Memory::new("test");
+        mem.add("some doc", "rec");
+        let results = mem.get_memories("!!!", 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_add_batch() {
+        let mut mem = BM25Memory::new("test");
+        mem.add_batch(&[
+            ("doc one".into(), "rec one".into()),
+            ("doc two".into(), "rec two".into()),
+        ]);
+        assert_eq!(mem.len(), 2);
+    }
+
+    #[test]
+    fn test_relevance_ordering() {
+        let mut mem = BM25Memory::new("test");
+        mem.add("apple fruit juice drink", "fruit");
+        mem.add("apple stock price nasdaq", "stock");
+        mem.add("orange banana mango", "other");
+
+        let results = mem.get_memories("apple stock market", 3);
+        // "apple stock price nasdaq" should rank highest (2 matching terms)
+        assert_eq!(results[0].recommendation, "stock");
+    }
+
+    #[test]
+    fn test_similarity_score_bounded() {
+        let mut mem = BM25Memory::new("test");
+        mem.add("test document here", "rec");
+        let results = mem.get_memories("test document here", 1);
+        assert!(!results.is_empty());
+        assert!(results[0].similarity_score >= 0.0);
+        assert!(results[0].similarity_score <= 1.0);
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let dir = std::env::temp_dir().join("tagent_test_memory");
+        let path = dir.join("test_roundtrip.json");
+
+        // Save
+        let mut mem = BM25Memory::new("test");
+        mem.add("NVDA strong earnings", "BUY");
+        mem.add("Market downturn", "SELL");
+        mem.save(&path).unwrap();
+
+        // Load into fresh instance
+        let mem2 = BM25Memory::from_file("test", &path);
+        assert_eq!(mem2.len(), 2);
+
+        // Verify BM25 index was rebuilt — query should work
+        let results = mem2.get_memories("NVDA earnings", 1);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].recommendation, "BUY");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_from_file_missing_file() {
+        let mem = BM25Memory::from_file("test", Path::new("/nonexistent/path.json"));
+        assert!(mem.is_empty());
     }
 }

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Data fetching from Yahoo Finance public API
 //!
 //! Uses Yahoo Finance v8 API - no authentication required for basic stock data
@@ -97,8 +98,8 @@ impl YahooFinanceClient {
         let url = format!(
             "https://query1.finance.yahoo.com/v8/finance/chart/{}?period1={}&period2={}&interval=1d",
             symbol,
-            start.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
-            end.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp()
+            start.and_hms_opt(0, 0, 0).expect("valid hms").and_utc().timestamp(),
+            end.and_hms_opt(23, 59, 59).expect("valid hms").and_utc().timestamp()
         );
 
         let resp = self.client
@@ -142,10 +143,10 @@ impl YahooFinanceClient {
             ticker,
             NaiveDate::parse_from_str(start_date, "%Y-%m-%d")
                 .unwrap_or_else(|_| chrono::Utc::now().date_naive())
-                .and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
+                .and_hms_opt(0, 0, 0).expect("valid hms").and_utc().timestamp(),
             NaiveDate::parse_from_str(end_date, "%Y-%m-%d")
                 .unwrap_or_else(|_| chrono::Utc::now().date_naive())
-                .and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp()
+                .and_hms_opt(23, 59, 59).expect("valid hms").and_utc().timestamp()
         );
 
         let resp = self.client
@@ -166,7 +167,7 @@ impl YahooFinanceClient {
     fn date_to_timestamp(date_str: &str) -> Result<i64> {
         let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
             .with_context(|| format!("Invalid date format: {}", date_str))?;
-        Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())
+        Ok(date.and_hms_opt(0, 0, 0).expect("valid hms").and_utc().timestamp())
     }
 
     fn format_stock_data(symbol: &str, json: &serde_json::Value) -> Result<String> {
@@ -338,7 +339,7 @@ impl YahooFinanceClient {
 
         let profile = quote.and_then(|q| q.get("summaryProfile"));
         let stats = quote.and_then(|q| q.get("defaultKeyStatistics"));
-        let financial = quote.and_then(|q| q.get("financialData"));
+        let _financial = quote.and_then(|q| q.get("financialData"));
 
         let mut output = format!("## {} Fundamentals\n\n", ticker);
 
@@ -403,32 +404,71 @@ impl Default for YahooFinanceClient {
 }
 
 /// Tool execution router - routes tool calls to appropriate data sources
-pub async fn execute_tool(tool_name: &str, args: &serde_json::Value) -> Result<String> {
-    let client = YahooFinanceClient::new();
+pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &YahooFinanceClient) -> Result<String> {
+    use crate::tools::ToolName;
 
-    match tool_name {
-        "get_stock_data" => {
+    let tool = ToolName::from_str(tool_name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", tool_name))?;
+
+    match tool {
+        ToolName::GetStockData => {
             let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
             let start_date = args.get("start_date").and_then(|v| v.as_str()).unwrap_or("");
             let end_date = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
             client.get_stock_data(symbol, start_date, end_date).await
         }
-        "get_indicators" => {
+        ToolName::GetIndicators => {
             let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
             let curr_date = args.get("curr_date").and_then(|v| v.as_str()).unwrap_or("");
             let look_back = args.get("look_back_days").and_then(|v| v.as_i64()).unwrap_or(30) as i32;
             client.get_indicators(symbol, curr_date, look_back).await
         }
-        "get_fundamentals" => {
+        ToolName::GetFundamentals => {
             let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
             client.get_fundamentals(ticker).await
         }
-        "get_news" => {
+        ToolName::GetBalanceSheet | ToolName::GetCashflow | ToolName::GetIncomeStatement => {
+            let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
+            // These share the same fundamentals endpoint for now
+            client.get_fundamentals(ticker).await
+        }
+        ToolName::GetNews => {
             let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
             let start_date = args.get("start_date").and_then(|v| v.as_str()).unwrap_or("");
             let end_date = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
             client.get_news(ticker, start_date, end_date).await
         }
-        _ => anyhow::bail!("Unknown tool: {}", tool_name),
+        ToolName::GetGlobalNews => {
+            let curr_date = args.get("curr_date").and_then(|v| v.as_str()).unwrap_or("");
+            // Global news uses the same news endpoint with a broad query
+            client.get_news("^GSPC", curr_date, curr_date).await
+        }
+        ToolName::GetInsiderTransactions => {
+            let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
+            client.get_fundamentals(ticker).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_unknown_tool_returns_error() {
+        let client = YahooFinanceClient::new();
+        let args = serde_json::json!({});
+        let result = execute_tool("nonexistent_tool", &args, &client).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown tool"));
+    }
+
+    #[test]
+    fn test_format_date_range() {
+        // Verify date parsing doesn't panic on valid inputs
+        let start = chrono::NaiveDate::parse_from_str("2025-01-01", "%Y-%m-%d");
+        let end = chrono::NaiveDate::parse_from_str("2025-12-31", "%Y-%m-%d");
+        assert!(start.is_ok());
+        assert!(end.is_ok());
     }
 }
