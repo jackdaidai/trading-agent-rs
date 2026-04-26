@@ -2,3 +2,5 @@
 .env
 *.zip
 *.exe
+
+/target-rel

@@ -107,7 +107,11 @@ async fn main() -> Result<()> {
             let yf = yf.clone();
             let t = t.clone();
             validates.push(tokio::spawn(async move {
-                let prices = yf.get_stock_data(&t, "2d", "1d").await;
+                // Use recent 5-day window for validation
+                let today = chrono::Utc::now().date_naive();
+                let start = (today - chrono::Duration::days(5)).format("%Y-%m-%d").to_string();
+                let end = today.format("%Y-%m-%d").to_string();
+                let prices = yf.get_stock_data(&t, &start, &end).await;
                 match prices {
                     Ok(p) if p.is_empty() => Err(anyhow::anyhow!("Ticker '{}' returned no data", t)),
                     Err(e) => Err(anyhow::anyhow!("Cannot fetch data for '{}': {}", t, e)),

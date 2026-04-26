@@ -155,10 +155,16 @@ impl GraphEngine {
     }
 
     async fn run_market_analyst(&self, ticker: &str, date: &str) -> Result<String> {
+        // Compute a 30-day lookback for stock data
+        let end = date;
+        let start = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map(|d| (d - chrono::Duration::days(30)).format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|_| date.to_string());
         let prompt = format!(
             r#"You are a market analyst. Analyze the stock data for {ticker} on {date}.
 
-            Use the get_stock_data tool to get recent OHLCV data, and get_indicators tool to get RSI, MACD, Bollinger Bands.
+            Use the get_stock_data tool with start_date="{start}" and end_date="{end}" to get recent OHLCV data.
+            Use the get_indicators tool with curr_date="{end}" to get RSI, MACD, Bollinger Bands.
 
             Provide a concise market analysis covering:
             - Current price trend

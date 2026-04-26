@@ -432,8 +432,13 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
     match tool {
         ToolName::GetStockData => {
             let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            let start_date = args.get("start_date").and_then(|v| v.as_str()).unwrap_or("");
-            let end_date = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_start = args.get("start_date").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_end = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
+            // Default empty dates to last 30 days
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let thirty_ago = (chrono::Utc::now() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+            let end_date = if raw_end.is_empty() { &today } else { raw_end };
+            let start_date = if raw_start.is_empty() { &thirty_ago } else { raw_start };
             client.get_stock_data(symbol, start_date, end_date).await
         }
         ToolName::GetIndicators => {
