@@ -2,8 +2,56 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, bail};
 use std::time::Duration;
+use std::future::Future;
+use std::pin::Pin;
+
+// =============================================================================
+// Retry helper — exponential backoff on 429 / 5xx
+// =============================================================================
+
+const MAX_RETRIES: u32 = 3;
+const BASE_DELAY_MS: u64 = 1000;
+
+async fn retry_request(
+    build_request: impl Fn() -> Pin<Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Send>>,
+) -> Result<Value> {
+    for attempt in 0..=MAX_RETRIES {
+        let resp = build_request().await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) if attempt < MAX_RETRIES => {
+                let delay = BASE_DELAY_MS * 2u64.pow(attempt);
+                tracing::warn!("Request error (attempt {}): {}. Retrying in {}ms", attempt + 1, e, delay);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                continue;
+            }
+            Err(e) => return Err(e).context("Request failed after retries"),
+        };
+
+        let status = resp.status();
+        if status == 429 || status.is_server_error() {
+            if attempt < MAX_RETRIES {
+                let delay = BASE_DELAY_MS * 2u64.pow(attempt);
+                tracing::warn!("HTTP {} (attempt {}). Retrying in {}ms", status, attempt + 1, delay);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                continue;
+            }
+            bail!("HTTP {} after {} retries", status, MAX_RETRIES);
+        }
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("HTTP {}: {}", status, body);
+        }
+
+        let json: Value = resp.json().await.context("Failed to parse response JSON")?;
+        return Ok(json);
+    }
+    unreachable!()
+}
 
 
 /// Tool definition for LLM tool calling
@@ -98,15 +146,21 @@ impl LLMClient for OpenAIClient {
             }).collect::<Vec<_>>());
         }
 
-        let resp = self.client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await
-            .context("OpenAI request failed")?;
-
-        let resp_json: Value = resp.json().await.context("Failed to parse OpenAI response")?;
+        let resp_json = retry_request(|| {
+            let client = self.client.clone();
+            let url = format!("{}/v1/messages", self.base_url);
+            let key = self.api_key.clone();
+            let body = body.clone();
+            Box::pin(async move {
+                client.post(&url)
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+            })
+        }).await?;
 
         // Extract content
         let content = resp_json["choices"][0]["message"]["content"]
@@ -192,17 +246,21 @@ impl LLMClient for AnthropicClient {
             body["thinking"] = json!({"type": "disabled"});
         }
 
-        let resp = self.client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("Anthropic request failed")?;
-
-        let resp_json: Value = resp.json().await.context("Failed to parse Anthropic response")?;
+        let resp_json = retry_request(|| {
+            let client = self.client.clone();
+            let url = format!("{}/v1/messages", self.base_url);
+            let key = self.api_key.clone();
+            let body = body.clone();
+            Box::pin(async move {
+                client.post(&url)
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+            })
+        }).await?;
 
         // Extract content blocks
         let mut content = String::new();

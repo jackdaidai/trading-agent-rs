@@ -54,6 +54,7 @@ pub struct TechnicalIndicators {
 }
 
 /// Yahoo Finance data fetcher
+#[derive(Clone)]
 pub struct YahooFinanceClient {
     client: Client,
 }
@@ -283,36 +284,54 @@ impl YahooFinanceClient {
     }
 
     fn calculate_macd(prices: &[f64]) -> Option<(f64, f64, f64)> {
-        if prices.len() < 26 {
+        // Need at least 26 + 9 - 1 = 34 prices for MACD + signal line
+        if prices.len() < 34 {
             return None;
         }
 
-        let ema12 = Self::ema(prices, 12)?;
-        let ema26 = Self::ema(prices, 26)?;
+        let ema12_series = Self::ema_series(prices, 12)?;
+        let ema26_series = Self::ema_series(prices, 26)?;
 
-        let macd_line = ema12 - ema26;
+        // MACD line = EMA12 - EMA26, aligned to EMA26 length
+        let offset = ema12_series.len() - ema26_series.len();
+        let macd_series: Vec<f64> = ema12_series[offset..]
+            .iter()
+            .zip(ema26_series.iter())
+            .map(|(e12, e26)| e12 - e26)
+            .collect();
 
-        // Signal line is 9-period EMA of MACD line
-        // For simplicity, just return MACD as signal
-        let signal = macd_line * 0.9; // approximate
+        // Signal line = 9-period EMA of MACD series
+        let signal_series = Self::ema_series(&macd_series, 9)?;
+
+        let macd_line = *macd_series.last()?;
+        let signal = *signal_series.last()?;
         let hist = macd_line - signal;
 
         Some((macd_line, signal, hist))
     }
 
-    fn ema(prices: &[f64], period: usize) -> Option<f64> {
+    /// Compute EMA series (all values from the initial SMA onward)
+    fn ema_series(prices: &[f64], period: usize) -> Option<Vec<f64>> {
         if prices.len() < period {
             return None;
         }
 
         let multiplier = 2.0 / (period as f64 + 1.0);
-        let mut ema = prices[0..period].iter().sum::<f64>() / period as f64;
+        let initial_sma = prices[0..period].iter().sum::<f64>() / period as f64;
+
+        let mut series = Vec::with_capacity(prices.len() - period + 1);
+        series.push(initial_sma);
 
         for price in &prices[period..] {
-            ema = (*price * multiplier) + (ema * (1.0 - multiplier));
+            let prev = *series.last().unwrap();
+            series.push((*price * multiplier) + (prev * (1.0 - multiplier)));
         }
 
-        Some(ema)
+        Some(series)
+    }
+
+    fn ema(prices: &[f64], period: usize) -> Option<f64> {
+        Self::ema_series(prices, period).and_then(|s| s.last().copied())
     }
 
     fn calculate_bollinger(prices: &[f64], period: usize, std_dev: f64) -> Option<(f64, f64, f64)> {
@@ -423,13 +442,9 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
             let look_back = args.get("look_back_days").and_then(|v| v.as_i64()).unwrap_or(30) as i32;
             client.get_indicators(symbol, curr_date, look_back).await
         }
-        ToolName::GetFundamentals => {
+        ToolName::GetFinancials => {
             let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
-            client.get_fundamentals(ticker).await
-        }
-        ToolName::GetBalanceSheet | ToolName::GetCashflow | ToolName::GetIncomeStatement => {
-            let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
-            // These share the same fundamentals endpoint for now
+            // All report_type variants currently resolve to the same fundamentals endpoint
             client.get_fundamentals(ticker).await
         }
         ToolName::GetNews => {
@@ -442,10 +457,6 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
             let curr_date = args.get("curr_date").and_then(|v| v.as_str()).unwrap_or("");
             // Global news uses the same news endpoint with a broad query
             client.get_news("^GSPC", curr_date, curr_date).await
-        }
-        ToolName::GetInsiderTransactions => {
-            let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
-            client.get_fundamentals(ticker).await
         }
     }
 }
@@ -465,10 +476,62 @@ mod tests {
 
     #[test]
     fn test_format_date_range() {
-        // Verify date parsing doesn't panic on valid inputs
         let start = chrono::NaiveDate::parse_from_str("2025-01-01", "%Y-%m-%d");
         let end = chrono::NaiveDate::parse_from_str("2025-12-31", "%Y-%m-%d");
         assert!(start.is_ok());
         assert!(end.is_ok());
+    }
+
+    // ---- EMA / MACD tests ----
+
+    #[test]
+    fn test_ema_too_few_prices() {
+        assert!(YahooFinanceClient::ema(&[1.0, 2.0], 5).is_none());
+        assert!(YahooFinanceClient::ema_series(&[1.0], 3).is_none());
+    }
+
+    #[test]
+    fn test_ema_exact_period() {
+        // With exactly `period` prices, EMA == SMA of those prices.
+        let prices = vec![2.0, 4.0, 6.0];
+        let ema = YahooFinanceClient::ema(&prices, 3).unwrap();
+        assert!((ema - 4.0).abs() < 1e-9); // SMA = (2+4+6)/3 = 4
+    }
+
+    #[test]
+    fn test_ema_series_length() {
+        let prices: Vec<f64> = (1..=20).map(|x| x as f64).collect();
+        let series = YahooFinanceClient::ema_series(&prices, 5).unwrap();
+        // length = prices.len() - period + 1
+        assert_eq!(series.len(), 16);
+    }
+
+    #[test]
+    fn test_ema_series_first_value_is_sma() {
+        let prices: Vec<f64> = (1..=10).map(|x| x as f64).collect();
+        let series = YahooFinanceClient::ema_series(&prices, 5).unwrap();
+        let sma = (1.0 + 2.0 + 3.0 + 4.0 + 5.0) / 5.0;
+        assert!((series[0] - sma).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_bollinger_too_few() {
+        assert!(YahooFinanceClient::calculate_bollinger(&[1.0, 2.0], 5, 2.0).is_none());
+    }
+
+    #[test]
+    fn test_bollinger_constant_prices() {
+        let prices = vec![10.0; 20];
+        let (upper, mid, lower) = YahooFinanceClient::calculate_bollinger(&prices, 20, 2.0).unwrap();
+        assert!((mid - 10.0).abs() < 1e-9);
+        assert!((upper - 10.0).abs() < 1e-9); // std = 0
+        assert!((lower - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_date_to_timestamp() {
+        let ts = YahooFinanceClient::date_to_timestamp("2025-01-01").unwrap();
+        assert!(ts > 0);
+        assert!(YahooFinanceClient::date_to_timestamp("not-a-date").is_err());
     }
 }

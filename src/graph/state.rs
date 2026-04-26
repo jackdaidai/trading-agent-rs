@@ -86,27 +86,44 @@ impl AgentState {
     }
 }
 
-/// State update returned by node execution
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct StateUpdate {
-    pub field: String,
-    pub value: String,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[allow(dead_code)]
-impl StateUpdate {
-    pub fn set(field: &str, value: &str) -> Self {
-        Self {
-            field: field.to_string(),
-            value: value.to_string(),
-        }
+    #[test]
+    fn test_agent_state_new() {
+        let s = AgentState::new("AAPL", "2025-06-01");
+        assert_eq!(s.company_of_interest, "AAPL");
+        assert_eq!(s.trade_date, "2025-06-01");
+        assert!(s.market_report.is_empty());
+        assert!(s.messages.is_empty());
     }
 
-    pub fn append(field: &str, value: &str) -> Self {
-        Self {
-            field: field.to_string(),
-            value: value.to_string(),
-        }
+    #[test]
+    fn test_agent_state_default() {
+        let s = AgentState::default();
+        assert!(s.company_of_interest.is_empty());
+        assert_eq!(s.investment_debate_state.count, 0);
+        assert_eq!(s.risk_debate_state.count, 0);
+    }
+
+    #[test]
+    fn test_situation_summary_truncates() {
+        let mut s = AgentState::new("TSLA", "2025-01-01");
+        s.market_report = "x".repeat(500);
+        let summary = s.situation_summary();
+        // 200 chars max per field
+        assert!(summary.len() < 500 * 4);
+        assert!(summary.contains("TSLA"));
+    }
+
+    #[test]
+    fn test_debate_states_clone() {
+        let mut s = AgentState::new("NVDA", "2025-01-01");
+        s.investment_debate_state.count = 3;
+        s.risk_debate_state.count = 5;
+        let cloned = s.clone();
+        assert_eq!(cloned.investment_debate_state.count, 3);
+        assert_eq!(cloned.risk_debate_state.count, 5);
     }
 }

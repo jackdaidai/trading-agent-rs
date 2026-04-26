@@ -83,7 +83,9 @@ impl GraphEngine {
 
         // ========== PHASE 1: Parallel Analysts ==========
         tracing::info!("Phase 1: Running analysts in parallel...");
+        let t = std::time::Instant::now();
         let analyst_results = self.run_analysts(&state).await?;
+        tracing::info!("Phase 1 done in {:.1}s", t.elapsed().as_secs_f64());
         state.market_report = analyst_results.market.clone();
         state.sentiment_report = analyst_results.social.clone();
         state.news_report = analyst_results.news.clone();
@@ -91,25 +93,35 @@ impl GraphEngine {
 
         // ========== PHASE 2: Bull/Bear Debate ==========
         tracing::info!("Phase 2: Running bull/bear debate...");
+        let t = std::time::Instant::now();
         self.run_bull_bear_debate(&mut state).await?;
+        tracing::info!("Phase 2 done in {:.1}s", t.elapsed().as_secs_f64());
 
         // ========== PHASE 3: Research Manager ==========
         tracing::info!("Phase 3: Research manager synthesis...");
+        let t = std::time::Instant::now();
         let investment_plan = self.run_research_manager(&state).await?;
+        tracing::info!("Phase 3 done in {:.1}s", t.elapsed().as_secs_f64());
         state.investment_plan = investment_plan;
 
         // ========== PHASE 4: Trader ==========
         tracing::info!("Phase 4: Trader decision...");
+        let t = std::time::Instant::now();
         let trader_plan = self.run_trader(&state).await?;
+        tracing::info!("Phase 4 done in {:.1}s", t.elapsed().as_secs_f64());
         state.trader_investment_plan = trader_plan;
 
         // ========== PHASE 5: Risk Debate ==========
         tracing::info!("Phase 5: Risk debate...");
+        let t = std::time::Instant::now();
         self.run_risk_debate(&mut state).await?;
+        tracing::info!("Phase 5 done in {:.1}s", t.elapsed().as_secs_f64());
 
         // ========== PHASE 6: Portfolio Manager ==========
         tracing::info!("Phase 6: Portfolio manager synthesis...");
+        let t = std::time::Instant::now();
         let decision = self.run_portfolio_manager(&state).await?;
+        tracing::info!("Phase 6 done in {:.1}s", t.elapsed().as_secs_f64());
         state.final_trade_decision = decision;
 
         tracing::info!("Analysis complete for {}", state.company_of_interest);
@@ -211,7 +223,7 @@ impl GraphEngine {
         let prompt = format!(
             r#"You are a fundamentals analyst. Analyze fundamental data for {ticker} on {date}.
 
-            Use the get_fundamentals tool to get company overview, and relevant financial statement tools if available.
+            Use the get_financials tool (with report_type: overview, balance_sheet, cashflow, income_statement, or insider_transactions) to gather data.
 
             Provide a concise fundamentals analysis covering:
             - Business model and competitive position
@@ -222,7 +234,7 @@ impl GraphEngine {
             End with: FINAL FUNDAMENTALS ANALYSIS: **STRONG/WEAK/FAIR**"#
         );
 
-        let tools = vec![self.tool_registry.get_by_name(ToolName::GetFundamentals)];
+        let tools = vec![self.tool_registry.get_by_name(ToolName::GetFinancials)];
 
         self.execute_llm_with_tools(&prompt, &tools).await
     }
@@ -554,33 +566,44 @@ impl GraphEngine {
     // -------------------------------------------------------------------------
 
     async fn execute_llm_with_tools(&self, prompt: &str, tools: &[Tool]) -> Result<String> {
-        let response = self.llm_quick.complete_with_tools(prompt, tools).await?;
+        const MAX_ROUNDS: usize = 3;
+        let mut messages = prompt.to_string();
 
-        // Handle tool calls
-        if let Some(tool_calls) = response.tool_calls {
+        for round in 0..MAX_ROUNDS {
+            let response = if round == 0 {
+                self.llm_quick.complete_with_tools(&messages, tools).await?
+            } else {
+                self.llm_quick.complete_with_tools(&messages, tools).await?
+            };
+
+            let tool_calls = match response.tool_calls {
+                Some(tc) if !tc.is_empty() => tc,
+                _ => return Ok(response.content),
+            };
+
             let mut tool_results = Vec::new();
-
             for tc in tool_calls {
-                tracing::info!("Executing tool: {}", tc.name);
+                tracing::info!("Round {}: executing tool {}", round + 1, tc.name);
                 match yfinance::execute_tool(&tc.name, &tc.arguments, &self.yfinance).await {
                     Ok(result) => tool_results.push(format!("Tool {} result: {}", tc.name, result)),
-                    Err(e) => tool_results.push(format!("Tool {} error: {}", tc.name, e)),
+                    Err(e) => {
+                        tracing::warn!("Tool {} failed: {}", tc.name, e);
+                        tool_results.push(format!("Tool {} error: {}", tc.name, e));
+                    }
                 }
             }
 
-            // Continue with tool results
-            let follow_up = format!(
-                "{}\n\nHere are the tool results:\n{}",
-                prompt,
+            messages = format!(
+                "{}\n\nTool results (round {}):\n{}",
+                messages,
+                round + 1,
                 tool_results.join("\n")
             );
-
-            // Final response after tool execution
-            let final_response = self.llm_quick.complete(&follow_up).await?;
-            Ok(final_response)
-        } else {
-            Ok(response.content)
         }
+
+        // Max rounds reached — ask LLM to summarize with what it has
+        let final_response = self.llm_quick.complete(&messages).await?;
+        Ok(final_response)
     }
 }
 

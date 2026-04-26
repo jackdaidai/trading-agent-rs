@@ -15,13 +15,9 @@ use std::collections::HashMap;
 pub enum ToolName {
     GetStockData,
     GetIndicators,
-    GetFundamentals,
-    GetBalanceSheet,
-    GetCashflow,
-    GetIncomeStatement,
+    GetFinancials,
     GetNews,
     GetGlobalNews,
-    GetInsiderTransactions,
 }
 
 impl ToolName {
@@ -29,13 +25,9 @@ impl ToolName {
         match self {
             Self::GetStockData => "get_stock_data",
             Self::GetIndicators => "get_indicators",
-            Self::GetFundamentals => "get_fundamentals",
-            Self::GetBalanceSheet => "get_balance_sheet",
-            Self::GetCashflow => "get_cashflow",
-            Self::GetIncomeStatement => "get_income_statement",
+            Self::GetFinancials => "get_financials",
             Self::GetNews => "get_news",
             Self::GetGlobalNews => "get_global_news",
-            Self::GetInsiderTransactions => "get_insider_transactions",
         }
     }
 
@@ -43,13 +35,9 @@ impl ToolName {
         match s {
             "get_stock_data" => Some(Self::GetStockData),
             "get_indicators" => Some(Self::GetIndicators),
-            "get_fundamentals" => Some(Self::GetFundamentals),
-            "get_balance_sheet" => Some(Self::GetBalanceSheet),
-            "get_cashflow" => Some(Self::GetCashflow),
-            "get_income_statement" => Some(Self::GetIncomeStatement),
+            "get_financials" => Some(Self::GetFinancials),
             "get_news" => Some(Self::GetNews),
             "get_global_news" => Some(Self::GetGlobalNews),
-            "get_insider_transactions" => Some(Self::GetInsiderTransactions),
             _ => None,
         }
     }
@@ -59,13 +47,9 @@ impl ToolName {
         &[
             Self::GetStockData,
             Self::GetIndicators,
-            Self::GetFundamentals,
-            Self::GetBalanceSheet,
-            Self::GetCashflow,
-            Self::GetIncomeStatement,
+            Self::GetFinancials,
             Self::GetNews,
             Self::GetGlobalNews,
-            Self::GetInsiderTransactions,
         ]
     }
 }
@@ -101,56 +85,18 @@ pub fn get_all_tools() -> Vec<Tool> {
                 "required": ["symbol", "indicator", "curr_date"]
             }),
         },
-        // Fundamentals
+        // Financials (unified)
         Tool {
-            name: "get_fundamentals".to_string(),
-            description: "Get company fundamentals overview".to_string(),
+            name: "get_financials".to_string(),
+            description: "Get company financial data. Use report_type to select: overview, balance_sheet, cashflow, income_statement, or insider_transactions.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "ticker": {"type": "string", "description": "Stock ticker"},
+                    "report_type": {"type": "string", "description": "One of: overview, balance_sheet, cashflow, income_statement, insider_transactions", "default": "overview"},
                     "curr_date": {"type": "string", "description": "Current date"}
                 },
-                "required": ["ticker", "curr_date"]
-            }),
-        },
-        Tool {
-            name: "get_balance_sheet".to_string(),
-            description: "Get company balance sheet".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "Stock ticker"},
-                    "freq": {"type": "string", "description": "quarterly or annual", "default": "quarterly"},
-                    "curr_date": {"type": "string", "description": "Current date"}
-                },
-                "required": ["ticker", "curr_date"]
-            }),
-        },
-        Tool {
-            name: "get_cashflow".to_string(),
-            description: "Get company cash flow statement".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "Stock ticker"},
-                    "freq": {"type": "string", "description": "quarterly or annual", "default": "quarterly"},
-                    "curr_date": {"type": "string", "description": "Current date"}
-                },
-                "required": ["ticker", "curr_date"]
-            }),
-        },
-        Tool {
-            name: "get_income_statement".to_string(),
-            description: "Get company income statement".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "Stock ticker"},
-                    "freq": {"type": "string", "description": "quarterly or annual", "default": "quarterly"},
-                    "curr_date": {"type": "string", "description": "Current date"}
-                },
-                "required": ["ticker", "curr_date"]
+                "required": ["ticker"]
             }),
         },
         // News
@@ -178,17 +124,6 @@ pub fn get_all_tools() -> Vec<Tool> {
                     "limit": {"type": "integer", "description": "Number of articles", "default": 5}
                 },
                 "required": ["curr_date"]
-            }),
-        },
-        Tool {
-            name: "get_insider_transactions".to_string(),
-            description: "Get insider trading transactions".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "Stock ticker"}
-                },
-                "required": ["ticker"]
             }),
         },
     ]
@@ -257,5 +192,45 @@ impl ToolResult {
             content: content.to_string(),
             is_error: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_name_roundtrip() {
+        for variant in ToolName::all() {
+            let s = variant.as_str();
+            let back = ToolName::from_str(s).expect("roundtrip failed");
+            assert_eq!(back.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_tool_name_unknown() {
+        assert!(ToolName::from_str("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn test_tool_count() {
+        assert_eq!(ToolName::all().len(), 5);
+        assert_eq!(get_all_tools().len(), 5);
+    }
+
+    #[test]
+    fn test_tool_registry_lookup() {
+        let registry = ToolRegistry::new();
+        assert!(registry.get("get_stock_data").is_some());
+        assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_tool_result_ok_err() {
+        let ok = ToolResult::ok("success");
+        assert!(!ok.is_error);
+        let err = ToolResult::err("fail");
+        assert!(err.is_error);
     }
 }
