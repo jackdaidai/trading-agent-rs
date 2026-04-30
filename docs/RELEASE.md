@@ -2,6 +2,8 @@
 
 This project does not yet publish official binary releases. Use this guide when preparing one.
 
+Do not commit build outputs such as `target/`, `target-rel/`, or `.exe` files to the repository. If you want to distribute binaries, attach them to GitHub Releases or publish them from CI as release artifacts.
+
 ## Supported targets
 
 Start with source releases and clearly document tested platforms. Before publishing binaries, decide which targets are supported, for example:
@@ -16,7 +18,6 @@ Start with source releases and clearly document tested platforms. Before publish
 cargo fmt --check
 cargo test
 cargo build --release
-python yfinance_proxy.py get_stock_data AAPL 2026-04-01 2026-04-30
 ```
 
 Use mock LLM endpoints for release smoke tests when possible, so releases do not depend on paid API calls or real secrets.
@@ -39,6 +40,8 @@ Each release should include:
 - setup instructions
 - `.env.example`
 - `LICENSE` and `NOTICE`
+- platform binaries, if intentionally publishing binary releases
+- platform binaries, if intentionally publishing binary releases
 
 Do not include:
 
@@ -46,8 +49,30 @@ Do not include:
 - generated `reports/`
 - benchmark logs
 - provider API keys
-- local binaries or build directories unless they are intentional release artifacts
+- `target/` or `target-rel/` build directories
+- local binaries committed to git
+
+## Windows binary distribution
+
+On Windows, `cargo build --release` produces:
+
+```powershell
+target\release\tagent.exe
+```
+
+For users who do not want to install Rust, publish a zip file in GitHub Releases, for example:
+
+```text
+tagent-vX.Y.Z-windows-x86_64.zip
+├── tagent.exe
+├── .env.example
+├── README.md
+├── LICENSE
+└── NOTICE
+```
+
+The Windows binary fetches Yahoo Finance data natively through Rust HTTP calls, so users do not need Python for normal use.
 
 ## GitHub Actions note
 
-GitHub Actions CI can run automatically on every push and pull request. A typical workflow should run `cargo fmt --check`, `cargo test`, and Python proxy smoke tests before a release is tagged.
+GitHub Actions CI can run automatically on every push and pull request. A typical workflow should run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before a release is tagged.

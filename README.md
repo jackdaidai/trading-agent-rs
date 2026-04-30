@@ -2,13 +2,15 @@
 
 TAgent is a Rust-based trading-analysis agent that combines market data, news, fundamentals, multi-agent debate, and LLM synthesis into a generated ticker report.
 
+It is a Rust rebuild inspired by [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents). The main motivation is performance: the original Python workflow can become slow when analyzing multiple tickers, because each ticker runs a long multi-agent pipeline. TAgent keeps the TradingAgents-style research/debate/synthesis flow, but rewrites the orchestration in Rust so ticker validation, analyst phases, debates, and batch runs can execute with lower overhead and controlled concurrency.
+
 > This project is for research and education only. It is not financial advice, investment advice, or a recommendation to buy, sell, or hold any security.
 >
 > TAgent is a Rust rebuild inspired by [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents), which is licensed under Apache-2.0.
 
 ## What it does
 
-- Fetches market data, technical indicators, fundamentals, and news through a Python `yfinance` proxy.
+- Fetches market data, technical indicators, fundamentals, and news through native Rust HTTP calls to Yahoo Finance public endpoints.
 - Runs a multi-phase analysis pipeline:
   1. market, sentiment, news, and fundamentals analysts
   2. bull/bear debate
@@ -18,12 +20,11 @@ TAgent is a Rust-based trading-analysis agent that combines market data, news, f
   6. portfolio-manager final synthesis
 - Supports Anthropic-compatible providers, OpenAI-compatible providers, MiniMax, and Z.ai.
 - Saves generated reports under `reports/`.
+- Improves multi-ticker workflows with Rust async execution and configurable batch concurrency.
 
 ## Prerequisites
 
 - Rust toolchain with Cargo
-- Python 3.10+
-- Python dependencies from `requirements.txt`
 - An API key for one supported LLM provider
 
 ## Setup
@@ -32,7 +33,6 @@ TAgent is a Rust-based trading-analysis agent that combines market data, news, f
 git clone <repo-url>
 cd tagent
 
-python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
@@ -50,12 +50,20 @@ cargo test
 cargo build --release
 ```
 
+After a release build, the Windows binary is at `target\release\tagent.exe`.
+
 ## Usage
 
 Run one ticker for today's local date:
 
 ```powershell
 cargo run -- AAPL
+```
+
+Or, after building a release binary:
+
+```powershell
+target\release\tagent.exe AAPL
 ```
 
 Run one ticker for an explicit date:
@@ -85,7 +93,7 @@ TAgent loads `.env` automatically. Generic `TAGENT_*` variables override provide
 | `TAGENT_QUICK_MODEL` | Model for analyst/tool-heavy calls | `TAGENT_MODEL` |
 | `TAGENT_DEEP_MODEL` | Model for synthesis calls | `TAGENT_MODEL` |
 | `TAGENT_BATCH_CONCURRENCY` | Number of ticker analyses to run concurrently in batch mode | `1` |
-| `TAGENT_YFINANCE_PROXY` | Path to the Python yfinance proxy script | `yfinance_proxy.py` |
+| `TAGENT_YAHOO_BASE_URL` | Optional Yahoo Finance base URL override | `https://query1.finance.yahoo.com` |
 
 Provider-specific variables:
 
@@ -108,14 +116,7 @@ cargo test
 
 GitHub Actions CI runs these checks on every push and pull request.
 
-The Python proxy can also be exercised directly:
-
-```powershell
-python yfinance_proxy.py get_stock_data AAPL 2026-04-01 2026-04-30
-python yfinance_proxy.py get_indicators AAPL 2026-04-30 30
-python yfinance_proxy.py get_financials AAPL
-python yfinance_proxy.py get_news AAPL 2026-04-01 2026-04-30
-```
+Yahoo Finance data is fetched natively from Rust; no Python runtime is required for normal use.
 
 ## Project docs
 

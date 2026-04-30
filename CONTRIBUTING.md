@@ -1,11 +1,10 @@
 # Contributing to TAgent
 
-Thanks for helping improve TAgent. This project combines Rust orchestration, a Python data proxy, and LLM provider integrations, so contributions should keep reliability, safety, and reproducibility in mind.
+Thanks for helping improve TAgent. This project combines Rust orchestration, native Yahoo Finance data fetching, and LLM provider integrations, so contributions should keep reliability, safety, and reproducibility in mind.
 
 ## Development setup
 
 ```powershell
-python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 cargo test
 ```
@@ -21,11 +20,10 @@ cargo fmt --check
 cargo test
 ```
 
-If your change affects Python data fetching, also run at least one proxy smoke test:
+If your change affects Yahoo Finance data fetching, also run at least one live smoke test through the Rust CLI with a mock or low-cost LLM endpoint when possible.
 
 ```powershell
-python yfinance_proxy.py get_stock_data AAPL 2026-04-01 2026-04-30
-python yfinance_proxy.py get_financials AAPL
+cargo test
 ```
 
 For LLM/provider behavior, prefer mock endpoints or small targeted tests where possible. Avoid adding tests that require paid API calls or real secrets.
@@ -50,7 +48,7 @@ For LLM/provider behavior, prefer mock endpoints or small targeted tests where p
 When filing an issue, include:
 
 - OS and shell
-- Rust and Python versions
+- Rust version
 - Provider name and model, without API keys
 - Command run
 - Relevant error output

@@ -1,2 +1,0 @@
-yfinance>=0.2.65
-python-dateutil>=2.9.0
