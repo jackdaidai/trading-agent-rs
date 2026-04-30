@@ -1,18 +1,10 @@
-//! TAgent - Fast Rust Trading Agent
-//!
-//! A high-performance Rust rewrite of TradingAgents with parallel execution.
-
-mod data;
-mod graph;
-mod llm;
-mod memory;
-mod tools;
-
-use crate::graph::engine::{GraphConfig, GraphEngine};
-use crate::graph::state::AgentState;
-use crate::llm::{AnyLLMClient, LLMClient};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::Arc;
+use tagent::config::AppConfig;
+use tagent::graph::engine::{GraphConfig, GraphEngine};
+use tagent::graph::state::AgentState;
+use tagent::llm::{AnyLLMClient, LLMClient};
 use tokio::sync::Semaphore;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -31,91 +23,28 @@ async fn main() -> Result<()> {
     // Load .env file
     dotenvy::dotenv().ok();
 
-    // Get LLM configuration from environment
-    // TAGENT_PROVIDER: "minimax" (default), "zai", "openai", "anthropic"
-    // Reads provider-specific keys: {MINIMAX,ZAI,OPENAI,ANTHROPIC}_{API_KEY,BASE_URL,MODEL}
-    // Falls back to TAGENT_API_KEY / TAGENT_BASE_URL / TAGENT_MODEL for ad-hoc overrides
-    let provider = std::env::var("TAGENT_PROVIDER")
-        .unwrap_or_else(|_| "minimax".to_string())
-        .to_lowercase();
-
-    let (api_key, base_url, default_model, api_key_env) = match provider.as_str() {
-        "minimax" => (
-            std::env::var("MINIMAX_API_KEY").unwrap_or_default(),
-            std::env::var("MINIMAX_BASE_URL")
-                .unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string()),
-            "MiniMax-M2.7".to_string(),
-            "MINIMAX_API_KEY",
-        ),
-        "zai" => (
-            std::env::var("ZAI_API_KEY").unwrap_or_default(),
-            std::env::var("ZAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.z.ai/api/anthropic".to_string()),
-            "GLM-5.1".to_string(),
-            "ZAI_API_KEY",
-        ),
-        "openai" => (
-            std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-            std::env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com".to_string()),
-            "gpt-4o".to_string(),
-            "OPENAI_API_KEY",
-        ),
-        "anthropic" => (
-            std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
-            "claude-sonnet-4-6".to_string(),
-            "ANTHROPIC_API_KEY",
-        ),
-        other => bail!(
-            "Unsupported TAGENT_PROVIDER '{}'. Expected minimax, zai, openai, or anthropic.",
-            other
-        ),
-    };
-
-    // Ad-hoc overrides (highest priority)
-    let api_key = std::env::var("TAGENT_API_KEY").unwrap_or(api_key);
-    let base_url = std::env::var("TAGENT_BASE_URL").unwrap_or(base_url);
-    let default_model = std::env::var("TAGENT_MODEL").unwrap_or(default_model);
-
-    let quick_model = std::env::var("TAGENT_QUICK_MODEL").unwrap_or_else(|_| default_model.clone());
-    let deep_model = std::env::var("TAGENT_DEEP_MODEL").unwrap_or(default_model);
-
-    if api_key.trim().is_empty() {
-        bail!(
-            "Missing API key for provider '{}'. Set TAGENT_API_KEY or {}.",
-            provider,
-            api_key_env
-        );
-    }
-    if base_url.trim().is_empty() {
-        bail!("Missing base URL for provider '{}'. Set TAGENT_BASE_URL or the provider-specific base URL.", provider);
-    }
-    if quick_model.trim().is_empty() || deep_model.trim().is_empty() {
-        bail!("Missing LLM model name. Set TAGENT_MODEL or both TAGENT_QUICK_MODEL and TAGENT_DEEP_MODEL.");
-    }
+    let app_config = AppConfig::from_env()?;
 
     tracing::info!(
         "Initializing TAgent with provider={}, quick={}, deep={}",
-        provider,
-        quick_model,
-        deep_model
+        app_config.llm.provider.as_str(),
+        app_config.llm.quick_model,
+        app_config.llm.deep_model
     );
 
     let llm_quick = Arc::new(AnyLLMClient::new(
-        &provider,
-        &quick_model,
-        &api_key,
-        &base_url,
-    ));
+        app_config.llm.provider.as_str(),
+        &app_config.llm.quick_model,
+        &app_config.llm.api_key,
+        &app_config.llm.base_url,
+    )?);
 
     let llm_deep = Arc::new(AnyLLMClient::new(
-        &provider,
-        &deep_model,
-        &api_key,
-        &base_url,
-    ));
+        app_config.llm.provider.as_str(),
+        &app_config.llm.deep_model,
+        &app_config.llm.api_key,
+        &app_config.llm.base_url,
+    )?);
 
     // Validate models
     if !llm_quick.validate_model() {
@@ -124,18 +53,18 @@ async fn main() -> Result<()> {
     if !llm_deep.validate_model() {
         anyhow::bail!("Invalid deep LLM configuration");
     }
+    tracing::debug!(
+        "LLM clients initialized: quick_provider={}, deep_provider={}",
+        llm_quick.provider_name(),
+        llm_deep.provider_name()
+    );
 
     // Create graph engine
-    let config = GraphConfig {
-        company: String::new(),
-        trade_date: String::new(),
-        max_debate_rounds: 1,
-        max_risk_discuss_rounds: 1,
-        max_recur_limit: 100,
-        output_language: "English".to_string(),
-    };
-
-    let engine = Arc::new(GraphEngine::new(config, llm_quick, llm_deep));
+    let engine = Arc::new(GraphEngine::new(
+        GraphConfig::default(),
+        llm_quick,
+        llm_deep,
+    ));
 
     // Parse command line args: tagent [TICKER...] [DATE]
     // Last arg matching YYYY-MM-DD is treated as date; rest are tickers.
@@ -168,7 +97,7 @@ async fn main() -> Result<()> {
 
     // Validate all tickers in parallel
     {
-        use crate::data::yfinance::YahooFinanceClient;
+        use tagent::data::yfinance::YahooFinanceClient;
         let yf = YahooFinanceClient::new();
         let mut validates = Vec::new();
         for t in &tickers {
@@ -198,8 +127,7 @@ async fn main() -> Result<()> {
     }
 
     // Run analysis — single ticker directly, multiple in parallel
-    let reports_dir = std::path::Path::new("reports");
-    std::fs::create_dir_all(reports_dir)?;
+    std::fs::create_dir_all(&app_config.reports_dir)?;
 
     if tickers.len() == 1 {
         let ticker = &tickers[0];
@@ -207,10 +135,16 @@ async fn main() -> Result<()> {
         let start = std::time::Instant::now();
         let result = engine.run(state).await?;
         let elapsed = start.elapsed();
-        print_and_save(ticker, &trade_date, &result.final_trade_decision, elapsed)?;
+        print_and_save(
+            &app_config.reports_dir,
+            ticker,
+            &trade_date,
+            &result.final_trade_decision,
+            elapsed,
+        )?;
     } else {
         let total_start = std::time::Instant::now();
-        let batch_concurrency = batch_concurrency()?;
+        let batch_concurrency = app_config.batch_concurrency;
         tracing::info!("Batch concurrency: {}", batch_concurrency);
         let limiter = Arc::new(Semaphore::new(batch_concurrency));
         let mut handles = Vec::new();
@@ -235,7 +169,7 @@ async fn main() -> Result<()> {
         for h in handles {
             match h.await? {
                 Ok((ticker, date, decision, elapsed)) => {
-                    print_and_save(&ticker, &date, &decision, elapsed)?;
+                    print_and_save(&app_config.reports_dir, &ticker, &date, &decision, elapsed)?;
                 }
                 Err(e) => {
                     tracing::error!("Analysis failed: {}", e);
@@ -255,23 +189,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn batch_concurrency() -> Result<usize> {
-    match std::env::var("TAGENT_BATCH_CONCURRENCY") {
-        Ok(value) => {
-            let parsed = value
-                .parse::<usize>()
-                .with_context(|| format!("Invalid TAGENT_BATCH_CONCURRENCY '{}'", value))?;
-            if parsed == 0 {
-                bail!("TAGENT_BATCH_CONCURRENCY must be at least 1");
-            }
-            Ok(parsed)
-        }
-        Err(std::env::VarError::NotPresent) => Ok(1),
-        Err(e) => Err(e).context("Invalid TAGENT_BATCH_CONCURRENCY"),
-    }
-}
-
 fn print_and_save(
+    reports_dir: &Path,
     ticker: &str,
     trade_date: &str,
     decision: &str,
@@ -284,7 +203,6 @@ fn print_and_save(
     println!("\n{}", decision);
     println!("\n[Completed in {:.0}s]", elapsed.as_secs_f64());
 
-    let reports_dir = std::path::Path::new("reports");
     std::fs::create_dir_all(reports_dir)?;
     let filename = format!("{}_{}.md", ticker, trade_date);
     let report_path = reports_dir.join(&filename);

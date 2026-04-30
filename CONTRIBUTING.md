@@ -11,12 +11,15 @@ cargo test
 
 Fill in `.env` only when you need to run live provider-backed analysis. Do not commit real API keys, generated reports, benchmark output, or local binaries.
 
+`Cargo.lock` is intentionally committed because TAgent is a binary application and release builds should be reproducible.
+
 ## Before opening a pull request
 
 Run the checks that apply to your change:
 
 ```powershell
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 

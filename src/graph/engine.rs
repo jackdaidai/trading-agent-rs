@@ -6,7 +6,7 @@
 use crate::data::yfinance::{self, YahooFinanceClient};
 use crate::graph::state::{AgentState, InvestDebateState, RiskDebateState};
 use crate::llm::{AnthropicContentBlock, AnthropicMessage, LLMClient, Tool};
-use crate::memory::BM25Memory;
+use crate::memory::{BM25Memory, MemoryMatch};
 use crate::tools::{ToolName, ToolRegistry};
 use anyhow::Result;
 use std::sync::Arc;
@@ -260,8 +260,9 @@ impl GraphEngine {
         let bear_memories = self.bear_memory.read().await.get_memories(&situation, 2);
 
         let memory_context = format!(
-            "Past lessons: Bull memories: {:?}, Bear memories: {:?}",
-            bull_memories, bear_memories
+            "Past lessons:\nBull memories:\n{}\nBear memories:\n{}",
+            format_memory_matches(&bull_memories),
+            format_memory_matches(&bear_memories)
         );
 
         let mut debate_state = InvestDebateState::default();
@@ -405,7 +406,10 @@ impl GraphEngine {
         let situation = state.situation_summary();
         let memories = self.trader_memory.read().await.get_memories(&situation, 2);
 
-        let memory_context = format!("Past trading lessons: {:?}", memories);
+        let memory_context = format!(
+            "Past trading lessons:\n{}",
+            format_memory_matches(&memories)
+        );
 
         let prompt = format!(
             r#"You are a trader converting the investment plan into a specific trading decision for {company}.
@@ -674,6 +678,23 @@ impl GraphEngine {
         let final_response = self.llm_quick.complete_messages(messages, tools).await?;
         Ok(final_response.content)
     }
+}
+
+fn format_memory_matches(memories: &[MemoryMatch]) -> String {
+    if memories.is_empty() {
+        return "None".to_string();
+    }
+
+    memories
+        .iter()
+        .map(|memory| {
+            format!(
+                "- Situation: {}; Recommendation: {}; Similarity: {:.2}",
+                memory.matched_situation, memory.recommendation, memory.similarity_score
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // =============================================================================

@@ -24,7 +24,7 @@ It is a Rust rebuild inspired by [TauricResearch/TradingAgents](https://github.c
 
 ## Prerequisites
 
-- Rust toolchain with Cargo
+- Rust 1.80 or newer with Cargo
 - An API key for one supported LLM provider
 
 ## Setup
@@ -93,6 +93,7 @@ TAgent loads `.env` automatically. Generic `TAGENT_*` variables override provide
 | `TAGENT_QUICK_MODEL` | Model for analyst/tool-heavy calls | `TAGENT_MODEL` |
 | `TAGENT_DEEP_MODEL` | Model for synthesis calls | `TAGENT_MODEL` |
 | `TAGENT_BATCH_CONCURRENCY` | Number of ticker analyses to run concurrently in batch mode | `1` |
+| `TAGENT_REPORTS_DIR` | Directory for generated Markdown reports | `reports` |
 | `TAGENT_YAHOO_BASE_URL` | Optional Yahoo Finance base URL override | `https://query1.finance.yahoo.com` |
 
 Provider-specific variables:
@@ -121,6 +122,8 @@ Yahoo Finance data is fetched natively from Rust; no Python runtime is required 
 ## Project docs
 
 - [Contributing guide](CONTRIBUTING.md)
+- [Architecture notes](docs/ARCHITECTURE.md)
+- [Development guide](docs/DEVELOPMENT.md)
 - [Security policy](SECURITY.md)
 - [Release guide](docs/RELEASE.md)
 - [Mock report example](examples/mock-report.md)

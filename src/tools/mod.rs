@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Tool registry and invocation system
 //!
 //! Tools are defined here and routed to vendor implementations (yfinance, alpha_vantage)
@@ -6,6 +5,7 @@
 use crate::llm::Tool;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// Type-safe tool names — adding a variant here without handling it in
 /// `execute_tool` will produce a compile error (non-exhaustive match).
@@ -30,17 +30,6 @@ impl ToolName {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "get_stock_data" => Some(Self::GetStockData),
-            "get_indicators" => Some(Self::GetIndicators),
-            "get_financials" => Some(Self::GetFinancials),
-            "get_news" => Some(Self::GetNews),
-            "get_global_news" => Some(Self::GetGlobalNews),
-            _ => None,
-        }
-    }
-
     /// All variants, used to generate tool definitions.
     pub fn all() -> &'static [Self] {
         &[
@@ -50,6 +39,21 @@ impl ToolName {
             Self::GetNews,
             Self::GetGlobalNews,
         ]
+    }
+}
+
+impl FromStr for ToolName {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "get_stock_data" => Ok(Self::GetStockData),
+            "get_indicators" => Ok(Self::GetIndicators),
+            "get_financials" => Ok(Self::GetFinancials),
+            "get_news" => Ok(Self::GetNews),
+            "get_global_news" => Ok(Self::GetGlobalNews),
+            _ => Err(anyhow::anyhow!("Unknown tool: {}", value)),
+        }
     }
 }
 
@@ -204,14 +208,14 @@ mod tests {
     fn test_tool_name_roundtrip() {
         for variant in ToolName::all() {
             let s = variant.as_str();
-            let back = ToolName::from_str(s).expect("roundtrip failed");
+            let back = s.parse::<ToolName>().expect("roundtrip failed");
             assert_eq!(back.as_str(), s);
         }
     }
 
     #[test]
     fn test_tool_name_unknown() {
-        assert!(ToolName::from_str("does_not_exist").is_none());
+        assert!("does_not_exist".parse::<ToolName>().is_err());
     }
 
     #[test]

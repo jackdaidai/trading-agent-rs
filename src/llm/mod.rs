@@ -20,7 +20,6 @@ pub struct AnthropicMessage {
 
 /// Content block types for Anthropic messages
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AnthropicContentBlock {
     /// Plain text content
     Text(String),
@@ -140,6 +139,109 @@ async fn retry_request(
     unreachable!()
 }
 
+fn parse_openai_response(resp_json: &Value) -> Result<LLMResponse> {
+    let message = resp_json
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .context("OpenAI response missing choices[0].message")?;
+    let content = optional_str(message, "content")
+        .unwrap_or_default()
+        .to_string();
+    let tool_calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let calls = value
+                .as_array()
+                .context("OpenAI response field choices[0].message.tool_calls is not an array")?
+                .iter()
+                .map(parse_openai_tool_call)
+                .collect::<Result<Vec<_>>>()?;
+            Some(calls)
+        }
+    };
+
+    Ok(LLMResponse {
+        content,
+        tool_calls,
+        reasoning: None,
+    })
+}
+
+fn parse_openai_tool_call(value: &Value) -> Result<ToolCall> {
+    let id = required_str(value, "id", "OpenAI tool call")?.to_string();
+    let function = value
+        .get("function")
+        .context("OpenAI tool call missing function object")?;
+    let name = required_str(function, "name", "OpenAI tool call function")?.to_string();
+    let args_text = required_str(function, "arguments", "OpenAI tool call function")?;
+    let arguments = serde_json::from_str(args_text)
+        .with_context(|| format!("Failed to parse OpenAI tool call arguments for '{}'", name))?;
+
+    Ok(ToolCall {
+        id,
+        name,
+        arguments,
+    })
+}
+
+fn parse_anthropic_response(resp_json: &Value) -> Result<LLMResponse> {
+    let blocks = resp_json
+        .get("content")
+        .and_then(Value::as_array)
+        .context("Anthropic response missing content array")?;
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+
+    for block in blocks {
+        match required_str(block, "type", "Anthropic content block")? {
+            "text" => {
+                content.push_str(required_str(block, "text", "Anthropic text content block")?);
+            }
+            "tool_use" => {
+                tool_calls.push(ToolCall {
+                    id: required_str(block, "id", "Anthropic tool_use content block")?.to_string(),
+                    name: required_str(block, "name", "Anthropic tool_use content block")?
+                        .to_string(),
+                    arguments: block
+                        .get("input")
+                        .context("Anthropic tool_use content block missing input")?
+                        .clone(),
+                });
+            }
+            other => {
+                tracing::warn!(
+                    "Ignoring unsupported Anthropic content block type '{}'",
+                    other
+                );
+            }
+        }
+    }
+
+    Ok(LLMResponse {
+        content,
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
+        reasoning: None,
+    })
+}
+
+fn required_str<'a>(value: &'a Value, key: &str, context: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .with_context(|| format!("{} missing non-empty string field '{}'", context, key))
+}
+
+fn optional_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
 /// Tool definition for LLM tool calling
 #[derive(Debug, Clone)]
 pub struct Tool {
@@ -153,6 +255,7 @@ pub struct Tool {
 pub struct LLMResponse {
     pub content: String,
     pub tool_calls: Option<Vec<ToolCall>>,
+    // Reserved for providers that return a separate reasoning channel.
     #[allow(dead_code)]
     pub reasoning: Option<String>,
 }
@@ -185,7 +288,6 @@ pub trait LLMClient: Send + Sync {
     fn validate_model(&self) -> bool;
 
     /// Provider name for logging
-    #[allow(dead_code)]
     fn provider_name(&self) -> &str;
 }
 
@@ -201,16 +303,16 @@ pub struct OpenAIClient {
 }
 
 impl OpenAIClient {
-    pub fn new(model: &str, api_key: &str, base_url: &str) -> Self {
-        Self {
+    pub fn new(model: &str, api_key: &str, base_url: &str) -> Result<Self> {
+        Ok(Self {
             model: model.to_string(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()
-                .expect("Failed to build HTTP client"),
-        }
+                .context("Failed to build OpenAI HTTP client")?,
+        })
     }
 }
 
@@ -261,36 +363,7 @@ impl LLMClient for OpenAIClient {
         })
         .await?;
 
-        // Extract content
-        let content = resp_json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        // Extract tool calls if present
-        let tool_calls = resp_json["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .map(|tc| {
-                tc.iter()
-                    .map(|t| {
-                        let args: Value = serde_json::from_str(
-                            t["function"]["arguments"].as_str().unwrap_or("{}"),
-                        )
-                        .unwrap_or(json!({}));
-                        ToolCall {
-                            id: t["id"].as_str().unwrap_or("").to_string(),
-                            name: t["function"]["name"].as_str().unwrap_or("").to_string(),
-                            arguments: args,
-                        }
-                    })
-                    .collect()
-            });
-
-        Ok(LLMResponse {
-            content,
-            tool_calls,
-            reasoning: None,
-        })
+        parse_openai_response(&resp_json)
     }
 
     async fn complete_messages(
@@ -341,16 +414,16 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
-    pub fn new(model: &str, api_key: &str, base_url: &str) -> Self {
-        Self {
+    pub fn new(model: &str, api_key: &str, base_url: &str) -> Result<Self> {
+        Ok(Self {
             model: model.to_string(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()
-                .expect("Failed to build HTTP client"),
-        }
+                .context("Failed to build Anthropic HTTP client")?,
+        })
     }
 }
 
@@ -401,37 +474,7 @@ impl LLMClient for AnthropicClient {
         })
         .await?;
 
-        // Extract content blocks
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-
-        if let Some(blocks) = resp_json["content"].as_array() {
-            for block in blocks {
-                match block["type"].as_str().unwrap_or("") {
-                    "text" => content.push_str(block["text"].as_str().unwrap_or("")),
-                    "tool_use" => {
-                        let id = block["id"].as_str().unwrap_or("").to_string();
-                        let args: Value = block.get("input").cloned().unwrap_or(json!({}));
-                        tool_calls.push(ToolCall {
-                            id,
-                            name: block["name"].as_str().unwrap_or("").to_string(),
-                            arguments: args,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Ok(LLMResponse {
-            content,
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(tool_calls)
-            },
-            reasoning: None,
-        })
+        parse_anthropic_response(&resp_json)
     }
 
     async fn complete_messages(
@@ -489,37 +532,7 @@ impl LLMClient for AnthropicClient {
         })
         .await?;
 
-        // Extract content blocks
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-
-        if let Some(blocks) = resp_json["content"].as_array() {
-            for block in blocks {
-                match block["type"].as_str().unwrap_or("") {
-                    "text" => content.push_str(block["text"].as_str().unwrap_or("")),
-                    "tool_use" => {
-                        let id = block["id"].as_str().unwrap_or("").to_string();
-                        let args: Value = block.get("input").cloned().unwrap_or(json!({}));
-                        tool_calls.push(ToolCall {
-                            id,
-                            name: block["name"].as_str().unwrap_or("").to_string(),
-                            arguments: args,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Ok(LLMResponse {
-            content,
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(tool_calls)
-            },
-            reasoning: None,
-        })
+        parse_anthropic_response(&resp_json)
     }
 
     fn validate_model(&self) -> bool {
@@ -541,14 +554,15 @@ pub enum AnyLLMClient {
 }
 
 impl AnyLLMClient {
-    pub fn new(provider: &str, model: &str, api_key: &str, base_url: &str) -> Self {
-        match provider.to_lowercase().as_str() {
+    pub fn new(provider: &str, model: &str, api_key: &str, base_url: &str) -> Result<Self> {
+        let client = match provider.to_lowercase().as_str() {
             "anthropic" | "minimax" | "zai" => {
                 // MiniMax and z.ai use Anthropic-compatible API
-                Self::Anthropic(AnthropicClient::new(model, api_key, base_url))
+                Self::Anthropic(AnthropicClient::new(model, api_key, base_url)?)
             }
-            _ => Self::OpenAI(OpenAIClient::new(model, api_key, base_url)),
-        }
+            _ => Self::OpenAI(OpenAIClient::new(model, api_key, base_url)?),
+        };
+        Ok(client)
     }
 }
 
@@ -596,7 +610,8 @@ impl LLMClient for AnyLLMClient {
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_url;
+    use super::{endpoint_url, parse_anthropic_response, parse_openai_response};
+    use serde_json::json;
 
     #[test]
     fn endpoint_url_avoids_duplicate_version_path() {
@@ -615,5 +630,81 @@ mod tests {
             ),
             "https://api.openai.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn parse_openai_response_rejects_malformed_tool_arguments() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "get_stock_data",
+                            "arguments": "{not-json}"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let err = parse_openai_response(&response).unwrap_err().to_string();
+        assert!(err.contains("Failed to parse OpenAI tool call arguments"));
+    }
+
+    #[test]
+    fn parse_openai_response_extracts_tool_calls() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "content": "checking",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "get_stock_data",
+                            "arguments": "{\"symbol\":\"AAPL\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let parsed = parse_openai_response(&response).unwrap();
+        assert_eq!(parsed.content, "checking");
+        let tool_calls = parsed.tool_calls.unwrap();
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "get_stock_data");
+        assert_eq!(tool_calls[0].arguments["symbol"], "AAPL");
+    }
+
+    #[test]
+    fn parse_anthropic_response_requires_content_blocks() {
+        let err = parse_anthropic_response(&json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing content array"));
+    }
+
+    #[test]
+    fn parse_anthropic_response_extracts_content_and_tool_calls() {
+        let response = json!({
+            "content": [
+                {"type": "text", "text": "Need data"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "get_news",
+                    "input": {"ticker": "MSFT"}
+                }
+            ]
+        });
+
+        let parsed = parse_anthropic_response(&response).unwrap();
+        assert_eq!(parsed.content, "Need data");
+        let tool_calls = parsed.tool_calls.unwrap();
+        assert_eq!(tool_calls[0].id, "toolu_1");
+        assert_eq!(tool_calls[0].name, "get_news");
+        assert_eq!(tool_calls[0].arguments["ticker"], "MSFT");
     }
 }

@@ -1,7 +1,12 @@
 /target
 .env
+.env.*
+!.env.example
 *.zip
 *.exe
+*.pdb
+*.dll
+*.lib
 
 /target-rel
 
@@ -12,3 +17,10 @@ benchmark-*.txt
 
 # Local scratch helpers
 inspect_git.py
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~

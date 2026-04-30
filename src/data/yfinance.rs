@@ -496,17 +496,13 @@ pub async fn execute_tool(
 ) -> Result<String> {
     use crate::tools::ToolName;
 
-    let tool = ToolName::from_str(tool_name)
-        .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", tool_name))?;
+    let tool = tool_name.parse::<ToolName>()?;
 
     match tool {
         ToolName::GetStockData => {
-            let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            let raw_start = args
-                .get("start_date")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let raw_end = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
+            let symbol = required_tool_arg(args, "symbol")?;
+            let raw_start = optional_tool_arg(args, "start_date");
+            let raw_end = optional_tool_arg(args, "end_date");
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
             let thirty_ago = (chrono::Utc::now() - chrono::Duration::days(30))
                 .format("%Y-%m-%d")
@@ -520,8 +516,8 @@ pub async fn execute_tool(
             client.get_stock_data(symbol, start_date, end_date).await
         }
         ToolName::GetIndicators => {
-            let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            let curr_date = args.get("curr_date").and_then(|v| v.as_str()).unwrap_or("");
+            let symbol = required_tool_arg(args, "symbol")?;
+            let curr_date = required_tool_arg(args, "curr_date")?;
             let look_back = args
                 .get("look_back_days")
                 .and_then(|v| v.as_i64())
@@ -529,23 +525,31 @@ pub async fn execute_tool(
             client.get_indicators(symbol, curr_date, look_back).await
         }
         ToolName::GetFinancials => {
-            let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
+            let ticker = required_tool_arg(args, "ticker")?;
             client.get_fundamentals(ticker).await
         }
         ToolName::GetNews => {
-            let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
-            let start_date = args
-                .get("start_date")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let end_date = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
+            let ticker = required_tool_arg(args, "ticker")?;
+            let start_date = optional_tool_arg(args, "start_date");
+            let end_date = optional_tool_arg(args, "end_date");
             client.get_news(ticker, start_date, end_date).await
         }
         ToolName::GetGlobalNews => {
-            let curr_date = args.get("curr_date").and_then(|v| v.as_str()).unwrap_or("");
+            let curr_date = required_tool_arg(args, "curr_date")?;
             client.get_news("^GSPC", curr_date, curr_date).await
         }
     }
+}
+
+fn required_tool_arg<'a>(args: &'a serde_json::Value, name: &str) -> Result<&'a str> {
+    args.get(name)
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Missing required tool argument '{}'", name))
+}
+
+fn optional_tool_arg<'a>(args: &'a serde_json::Value, name: &str) -> &'a str {
+    args.get(name).and_then(|v| v.as_str()).unwrap_or("")
 }
 
 #[cfg(test)]
@@ -589,6 +593,13 @@ mod tests {
         let (upper, middle, lower) = bollinger_bands(&values, 20).unwrap();
         assert!(upper > middle);
         assert!(middle > lower);
+    }
+
+    #[test]
+    fn test_required_tool_arg_rejects_missing_values() {
+        let args = serde_json::json!({"symbol": ""});
+        let err = required_tool_arg(&args, "symbol").unwrap_err().to_string();
+        assert!(err.contains("Missing required tool argument 'symbol'"));
     }
 
     #[tokio::test]

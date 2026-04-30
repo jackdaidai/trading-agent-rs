@@ -1,13 +1,12 @@
-#![allow(dead_code)]
 //! BM25 memory system for tracking past trading situations and lessons
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
-static WORD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[a-zA-Z0-9]+\b").unwrap());
+static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9]+\b").unwrap());
 
 /// A stored memory entry with situation and recommendation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,8 +26,12 @@ struct MemoryStore {
 /// BM25-based memory system
 pub struct BM25Memory {
     name: String,
+    // Populated when memories are added or loaded. Runtime starts with empty memory today,
+    // but persistence helpers use this to compute BM25 average document length.
+    #[allow(dead_code)]
     documents: Vec<String>,
     recommendations: Vec<String>,
+    #[allow(dead_code)]
     doc_lengths: Vec<usize>,
     avgdl: f64,
     idf: HashMap<String, f64>,
@@ -49,6 +52,7 @@ impl BM25Memory {
     }
 
     /// Load from a JSON file, or create empty if file doesn't exist / is invalid.
+    #[allow(dead_code)]
     pub fn from_file(name: &str, path: &Path) -> Self {
         let mut mem = Self::new(name);
         if let Ok(data) = std::fs::read_to_string(path) {
@@ -62,6 +66,7 @@ impl BM25Memory {
     }
 
     /// Persist current entries to a JSON file.
+    #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let store = MemoryStore {
             entries: self
@@ -91,6 +96,7 @@ impl BM25Memory {
     }
 
     /// Add a situation and its recommendation to memory
+    #[allow(dead_code)]
     pub fn add(&mut self, situation: &str, recommendation: &str) {
         let tokens = self.tokenize(situation);
         self.documents.push(situation.to_string());
@@ -101,6 +107,7 @@ impl BM25Memory {
     }
 
     /// Compute IDF values from document frequencies
+    #[allow(dead_code)]
     fn recompute_idf(&mut self) {
         let n = self.documents.len() as f64;
         if n == 0.0 {
@@ -133,6 +140,7 @@ impl BM25Memory {
     /// Get top-N similar memories for a given situation
     pub fn get_memories(&self, query: &str, n_matches: usize) -> Vec<MemoryMatch> {
         if self.documents.is_empty() {
+            tracing::debug!("BM25 memory '{}' has no entries", self.name);
             return Vec::new();
         }
 
@@ -186,16 +194,19 @@ impl BM25Memory {
     }
 
     /// Add multiple situations at once
+    #[allow(dead_code)]
     pub fn add_batch(&mut self, entries: &[(String, String)]) {
         for (situation, recommendation) in entries {
             self.add(situation, recommendation);
         }
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.documents.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
     }
