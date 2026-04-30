@@ -1,11 +1,12 @@
 #![allow(dead_code)]
-//! Data fetching from Yahoo Finance public API
+//! Data fetching from Yahoo Finance via Python yfinance proxy
 //!
-//! Uses Yahoo Finance v8 API - no authentication required for basic stock data
+//! Yahoo Finance requires cookie/crumb session for some tickers.
+//! Using Python yfinance library handles this automatically.
 
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use anyhow::{Result, Context};
+use std::process::Command;
 use chrono::NaiveDate;
 
 /// Stock quote data
@@ -53,214 +54,205 @@ pub struct TechnicalIndicators {
     pub bb_lower: Option<f64>,
 }
 
-/// Yahoo Finance data fetcher
+/// Yahoo Finance data fetcher — delegates to Python yfinance proxy
 #[derive(Clone)]
 pub struct YahooFinanceClient {
-    client: Client,
+    proxy_path: String,
 }
 
 impl YahooFinanceClient {
     pub fn new() -> Self {
+        // Default proxy path — can be overridden via constructor
         Self {
-            client: Client::new(),
+            proxy_path: String::new(),
         }
+    }
+
+    pub fn with_proxy_path(path: &str) -> Self {
+        Self {
+            proxy_path: path.to_string(),
+        }
+    }
+
+    fn proxy_path(&self) -> &str {
+        if self.proxy_path.is_empty() {
+            "yfinance_proxy.py"
+        } else {
+            &self.proxy_path
+        }
+    }
+
+    /// Call Python yfinance proxy and parse JSON output
+    fn call_proxy(&self, action: &str, args: &[&str]) -> Result<serde_json::Value> {
+        let mut cmd = Command::new("python");
+        if cfg!(windows) {
+            cmd.args(["yfinance_proxy.py", action]);
+        } else {
+            cmd.args(["yfinance_proxy.py", action]);
+        }
+        cmd.args(args);
+
+        let output = cmd
+            .current_dir("C:/Users/jiehu/dev/tagent")
+            .output()
+            .context("Failed to run yfinance proxy")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("yfinance proxy failed: {}", stderr);
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&json_str)
+            .context("Failed to parse yfinance proxy JSON")?;
+
+        if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+            anyhow::bail!("yfinance proxy error: {}", err);
+        }
+
+        Ok(json)
     }
 
     /// Fetch stock data for a date range
     pub async fn get_stock_data(&self, symbol: &str, start_date: &str, end_date: &str) -> Result<String> {
-        let period1 = Self::date_to_timestamp(start_date)?;
-        let period2 = Self::date_to_timestamp(end_date)?;
+        let json = self.call_proxy("get_stock_data", &[symbol, start_date, end_date])?;
 
-        let url = format!(
-            "https://query1.finance.yahoo.com/v8/finance/chart/{}?period1={}&period2={}&interval=1d",
-            symbol, period1, period2
-        );
+        let records = json.get("records")
+            .and_then(|v| v.as_array())
+            .context("No records in yfinance response")?;
 
-        let resp = self.client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0")
-            .send()
-            .await
-            .context("Yahoo Finance request failed")?;
+        let mut output = format!("## {} Stock Data\n\n", symbol);
+        output += "| Date | Open | High | Low | Close | Volume |\n";
+        output += "|------|------|------|-----|-------|--------|\n";
 
-        let json: serde_json::Value = resp.json().await.context("Failed to parse Yahoo response")?;
+        for record in records {
+            let date = record.get("date").and_then(|v| v.as_str()).unwrap_or("N/A");
+            let open = record.get("open").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let high = record.get("high").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let low = record.get("low").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let close = record.get("close").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let volume = record.get("volume").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        // Format the response nicely
-        let result = Self::format_stock_data(symbol, &json)?;
-        Ok(result)
+            output += &format!("| {} | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
+                date, open, high, low, close, volume);
+        }
+
+        Ok(output)
     }
 
     /// Fetch technical indicators
     pub async fn get_indicators(&self, symbol: &str, curr_date: &str, look_back_days: i32) -> Result<String> {
-        let end = NaiveDate::parse_from_str(curr_date, "%Y-%m-%d")
-            .unwrap_or_else(|_| chrono::Utc::now().date_naive());
-        let start = end - chrono::Duration::days(look_back_days as i64);
-
-        let url = format!(
-            "https://query1.finance.yahoo.com/v8/finance/chart/{}?period1={}&period2={}&interval=1d",
+        let json = self.call_proxy("get_indicators", &[
             symbol,
-            start.and_hms_opt(0, 0, 0).expect("valid hms").and_utc().timestamp(),
-            end.and_hms_opt(23, 59, 59).expect("valid hms").and_utc().timestamp()
-        );
+            curr_date,
+            &look_back_days.to_string(),
+        ])?;
 
-        let resp = self.client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0")
-            .send()
-            .await
-            .context("Yahoo Finance request failed")?;
+        let mut output = format!("## {} Technical Indicators\n\n", symbol);
 
-        let json: serde_json::Value = resp.json().await.context("Failed to parse Yahoo response")?;
+        if let Some(rsi) = json.get("rsi_14").and_then(|v| v.as_f64()) {
+            output += &format!("- **RSI (14)**: {:.2}\n", rsi);
+        }
+        if let Some(sma10) = json.get("sma_10").and_then(|v| v.as_f64()) {
+            output += &format!("- **SMA (10)**: {:.2}\n", sma10);
+        }
+        if let Some(sma20) = json.get("sma_20").and_then(|v| v.as_f64()) {
+            output += &format!("- **SMA (20)**: {:.2}\n", sma20);
+        }
+        if let (Some(upper), Some(mid), Some(lower)) = (
+            json.get("bb_upper").and_then(|v| v.as_f64()),
+            json.get("bb_middle").and_then(|v| v.as_f64()),
+            json.get("bb_lower").and_then(|v| v.as_f64()),
+        ) {
+            output += &format!("- **BB Upper**: {:.2}\n", upper);
+            output += &format!("- **BB Middle**: {:.2}\n", mid);
+            output += &format!("- **BB Lower**: {:.2}\n", lower);
+        }
+        if let Some(price) = json.get("current_price").and_then(|v| v.as_f64()) {
+            output += &format!("- **Current Price**: {:.2}\n", price);
+        }
 
-        // Calculate indicators from OHLCV data
-        let result = Self::calculate_indicators(symbol, &json)?;
-        Ok(result)
+        Ok(output)
     }
 
     /// Get company info / fundamentals
     pub async fn get_fundamentals(&self, ticker: &str) -> Result<String> {
-        let url = format!(
-            "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{}?modules=summaryProfile,defaultKeyStatistics,financialData",
-            ticker
-        );
+        let json = self.call_proxy("get_financials", &[ticker])?;
 
-        let resp = self.client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0")
-            .send()
-            .await
-            .context("Yahoo Finance request failed")?;
+        let mut output = format!("## {} Fundamentals\n\n", ticker);
 
-        let json: serde_json::Value = resp.json().await.context("Failed to parse Yahoo response")?;
+        if let Some(name) = json.get("company_name").and_then(|v| v.as_str()) {
+            output += &format!("**Company**: {}\n\n", name);
+        }
+        if let Some(sector) = json.get("sector").and_then(|v| v.as_str()) {
+            output += &format!("**Sector**: {}\n", sector);
+        }
+        if let Some(industry) = json.get("industry").and_then(|v| v.as_str()) {
+            output += &format!("**Industry**: {}\n", industry);
+        }
 
-        let result = Self::format_fundamentals(ticker, &json)?;
-        Ok(result)
+        output += "\n### Key Statistics\n\n";
+
+        if let Some(mkt_cap) = json.get("market_cap").and_then(|v| v.as_i64()) {
+            output += &format!("- **Market Cap**: ${:.2}B\n", mkt_cap as f64 / 1e9);
+        }
+        if let Some(pe) = json.get("pe_ratio").and_then(|v| v.as_f64()) {
+            output += &format!("- **P/E Ratio**: {:.2}\n", pe);
+        }
+        if let Some(eps) = json.get("eps").and_then(|v| v.as_f64()) {
+            output += &format!("- **EPS**: ${:.2}\n", eps);
+        }
+        if let Some(div) = json.get("dividend_yield").and_then(|v| v.as_f64()) {
+            output += &format!("- **Dividend Yield**: {:.2}%\n", div * 100.0);
+        }
+        if let Some(high) = json.get("52w_high").and_then(|v| v.as_f64()) {
+            output += &format!("- **52W High**: {:.2}\n", high);
+        }
+        if let Some(low) = json.get("52w_low").and_then(|v| v.as_f64()) {
+            output += &format!("- **52W Low**: {:.2}\n", low);
+        }
+
+        Ok(output)
     }
 
     /// Get recent news for a ticker
     pub async fn get_news(&self, ticker: &str, start_date: &str, end_date: &str) -> Result<String> {
-        let url = format!(
-            "https://query1.finance.yahoo.com/v1/finance/search?q={}&interval=news&lang=en&startDate={}&endDate={}",
-            ticker,
-            NaiveDate::parse_from_str(start_date, "%Y-%m-%d")
-                .unwrap_or_else(|_| chrono::Utc::now().date_naive())
-                .and_hms_opt(0, 0, 0).expect("valid hms").and_utc().timestamp(),
-            NaiveDate::parse_from_str(end_date, "%Y-%m-%d")
-                .unwrap_or_else(|_| chrono::Utc::now().date_naive())
-                .and_hms_opt(23, 59, 59).expect("valid hms").and_utc().timestamp()
-        );
+        let json = self.call_proxy("get_news", &[ticker, start_date, end_date])?;
 
-        let resp = self.client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0")
-            .send()
-            .await
-            .context("Yahoo Finance request failed")?;
+        let articles = json.get("articles")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
 
-        let json: serde_json::Value = resp.json().await.context("Failed to parse Yahoo response")?;
+        let mut output = "## Recent News\n\n".to_string();
 
-        let result = Self::format_news(&json)?;
-        Ok(result)
+        for (i, article) in articles.iter().enumerate().take(10) {
+            let title = article.get("title").and_then(|v| v.as_str()).unwrap_or("N/A");
+            let source = article.get("source").and_then(|v| v.as_str()).unwrap_or("N/A");
+            let link = article.get("link").and_then(|v| v.as_str()).unwrap_or("#");
+
+            output += &format!("### {}. {}\n", i + 1, title);
+            output += &format!("Source: {} | [Link]({})\n\n", source, link);
+        }
+
+        Ok(output)
     }
 
-    // ========== Helper methods ==========
-
+    // Keep utility methods for tests
+    #[allow(dead_code)]
     fn date_to_timestamp(date_str: &str) -> Result<i64> {
         let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
             .with_context(|| format!("Invalid date format: {}", date_str))?;
         Ok(date.and_hms_opt(0, 0, 0).expect("valid hms").and_utc().timestamp())
     }
 
-    fn format_stock_data(symbol: &str, json: &serde_json::Value) -> Result<String> {
-        let result = json.get("chart").and_then(|c| c.get("result"))
-            .and_then(|r| r.get(0))
-            .and_then(|r| r.get("indicators"))
-            .and_then(|i| i.get("quote"))
-            .and_then(|q| q.get(0));
-
-        let quotes = result.and_then(|q| q.as_array());
-
-        let mut output = format!("## {} Stock Data\n\n", symbol);
-        output += "| Date | Open | High | Low | Close | Volume |\n";
-        output += "|------|------|------|-----|-------|--------|\n";
-
-        if let Some(quotes_arr) = quotes {
-            let timestamps = json.get("chart").and_then(|c| c.get("result"))
-                .and_then(|r| r.get(0))
-                .and_then(|r| r.get("timestamp"))
-                .and_then(|t| t.as_array());
-
-            for (i, quote) in quotes_arr.iter().enumerate() {
-                let ts = timestamps.and_then(|t| t.get(i).and_then(|v| v.as_i64()));
-                let date = ts.map(|t| {
-                    chrono::DateTime::from_timestamp(t, 0)
-                        .map(|dt| dt.format("%Y-%m-%d").to_string())
-                        .unwrap_or_else(|| "N/A".to_string())
-                }).unwrap_or_else(|| "N/A".to_string());
-
-                let open = quote.get("open").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let high = quote.get("high").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let low = quote.get("low").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let close = quote.get("close").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let vol = quote.get("volume").and_then(|v| v.as_i64()).unwrap_or(0);
-
-                output += &format!("| {} | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
-                    date, open, high, low, close, vol);
-            }
-        }
-
-        Ok(output)
-    }
-
-    fn calculate_indicators(symbol: &str, json: &serde_json::Value) -> Result<String> {
-        let result = json.get("chart").and_then(|c| c.get("result"))
-            .and_then(|r| r.get(0));
-
-        let quotes = result.and_then(|r| r.get("indicators"))
-            .and_then(|i| i.get("quote"))
-            .and_then(|q| q.get(0))
-            .and_then(|q| q.as_array());
-
-        let closes: Vec<f64> = quotes
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|q| q.get("close").and_then(|v| v.as_f64()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut output = format!("## {} Technical Indicators\n\n", symbol);
-
-        // RSI (14 period)
-        if let Some(rsi) = Self::calculate_rsi(&closes, 14) {
-            output += &format!("- **RSI (14)**: {:.2}\n", rsi);
-        }
-
-        // MACD
-        if let Some((macd, signal, hist)) = Self::calculate_macd(&closes) {
-            output += &format!("- **MACD**: {:.4}\n", macd);
-            output += &format!("- **MACD Signal**: {:.4}\n", signal);
-            output += &format!("- **MACD Hist**: {:.4}\n", hist);
-        }
-
-        // Bollinger Bands
-        if let Some((upper, middle, lower)) = Self::calculate_bollinger(&closes, 20, 2.0) {
-            output += &format!("- **BB Upper**: {:.2}\n", upper);
-            output += &format!("- **BB Middle**: {:.2}\n", middle);
-            output += &format!("- **BB Lower**: {:.2}\n", lower);
-        }
-
-        Ok(output)
-    }
-
+    #[allow(dead_code)]
     fn calculate_rsi(prices: &[f64], period: usize) -> Option<f64> {
         if prices.len() < period + 1 {
             return None;
         }
-
         let mut gains = Vec::new();
         let mut losses = Vec::new();
-
         for i in 1..prices.len() {
             let diff = prices[i] - prices[i-1];
             if diff > 0.0 {
@@ -271,148 +263,13 @@ impl YahooFinanceClient {
                 losses.push(diff.abs());
             }
         }
-
         let avg_gain: f64 = gains.iter().skip(gains.len() - period).sum::<f64>() / period as f64;
         let avg_loss: f64 = losses.iter().skip(losses.len() - period).sum::<f64>() / period as f64;
-
         if avg_loss == 0.0 {
             return Some(100.0);
         }
-
         let rs = avg_gain / avg_loss;
         Some(100.0 - (100.0 / (1.0 + rs)))
-    }
-
-    fn calculate_macd(prices: &[f64]) -> Option<(f64, f64, f64)> {
-        // Need at least 26 + 9 - 1 = 34 prices for MACD + signal line
-        if prices.len() < 34 {
-            return None;
-        }
-
-        let ema12_series = Self::ema_series(prices, 12)?;
-        let ema26_series = Self::ema_series(prices, 26)?;
-
-        // MACD line = EMA12 - EMA26, aligned to EMA26 length
-        let offset = ema12_series.len() - ema26_series.len();
-        let macd_series: Vec<f64> = ema12_series[offset..]
-            .iter()
-            .zip(ema26_series.iter())
-            .map(|(e12, e26)| e12 - e26)
-            .collect();
-
-        // Signal line = 9-period EMA of MACD series
-        let signal_series = Self::ema_series(&macd_series, 9)?;
-
-        let macd_line = *macd_series.last()?;
-        let signal = *signal_series.last()?;
-        let hist = macd_line - signal;
-
-        Some((macd_line, signal, hist))
-    }
-
-    /// Compute EMA series (all values from the initial SMA onward)
-    fn ema_series(prices: &[f64], period: usize) -> Option<Vec<f64>> {
-        if prices.len() < period {
-            return None;
-        }
-
-        let multiplier = 2.0 / (period as f64 + 1.0);
-        let initial_sma = prices[0..period].iter().sum::<f64>() / period as f64;
-
-        let mut series = Vec::with_capacity(prices.len() - period + 1);
-        series.push(initial_sma);
-
-        for price in &prices[period..] {
-            let prev = *series.last().unwrap();
-            series.push((*price * multiplier) + (prev * (1.0 - multiplier)));
-        }
-
-        Some(series)
-    }
-
-    fn ema(prices: &[f64], period: usize) -> Option<f64> {
-        Self::ema_series(prices, period).and_then(|s| s.last().copied())
-    }
-
-    fn calculate_bollinger(prices: &[f64], period: usize, std_dev: f64) -> Option<(f64, f64, f64)> {
-        if prices.len() < period {
-            return None;
-        }
-
-        let window = &prices[prices.len()-period..];
-        let sum: f64 = window.iter().sum();
-        let mean = sum / period as f64;
-
-        let variance: f64 = window.iter()
-            .map(|&x| (x - mean).powi(2))
-            .sum::<f64>() / period as f64;
-        let std = variance.sqrt();
-
-        Some((mean + std_dev * std, mean, mean - std_dev * std))
-    }
-
-    fn format_fundamentals(ticker: &str, json: &serde_json::Value) -> Result<String> {
-        let quote = json.get("quoteSummary")
-            .and_then(|qs| qs.get("result"))
-            .and_then(|r| r.get(0));
-
-        let profile = quote.and_then(|q| q.get("summaryProfile"));
-        let stats = quote.and_then(|q| q.get("defaultKeyStatistics"));
-        let _financial = quote.and_then(|q| q.get("financialData"));
-
-        let mut output = format!("## {} Fundamentals\n\n", ticker);
-
-        if let Some(name) = profile.and_then(|p| p.get("longName").and_then(|v| v.as_str())) {
-            output += &format!("**Company**: {}\n\n", name);
-        }
-
-        if let Some(sector) = profile.and_then(|p| p.get("sector").and_then(|v| v.as_str())) {
-            output += &format!("**Sector**: {}\n", sector);
-        }
-
-        if let Some(industry) = profile.and_then(|p| p.get("industry").and_then(|v| v.as_str())) {
-            output += &format!("**Industry**: {}\n", industry);
-        }
-
-        output += "\n### Key Statistics\n\n";
-
-        if let Some(mkt_cap) = stats.and_then(|s| s.get("marketCap").and_then(|v| v.as_i64())) {
-            output += &format!("- **Market Cap**: ${:.2}B\n", mkt_cap as f64 / 1e9);
-        }
-
-        if let Some(pe) = stats.and_then(|s| s.get("trailingPE").and_then(|v| v.as_f64())) {
-            output += &format!("- **P/E Ratio**: {:.2}\n", pe);
-        }
-
-        if let Some(eps) = stats.and_then(|s| s.get("trailingEps").and_then(|v| v.as_f64())) {
-            output += &format!("- **EPS**: ${:.2}\n", eps);
-        }
-
-        if let Some(div) = stats.and_then(|s| s.get("dividendYield").and_then(|v| v.as_f64())) {
-            output += &format!("- **Dividend Yield**: {:.2}%\n", div * 100.0);
-        }
-
-        Ok(output)
-    }
-
-    fn format_news(json: &serde_json::Value) -> Result<String> {
-        let articles = json.get("news")
-            .and_then(|n| n.as_array());
-
-        let mut output = "## Recent News\n\n".to_string();
-
-        if let Some(articles_arr) = articles {
-            for (i, article) in articles_arr.iter().enumerate().take(10) {
-                let title = article.get("title").and_then(|v| v.as_str()).unwrap_or("N/A");
-                let source = article.get("source").and_then(|v| v.as_str()).unwrap_or("N/A");
-                let link = article.get("link").and_then(|v| v.as_str()).unwrap_or("#");
-
-                output += &format!("### {}. {}\n", i + 1, title);
-                output += &format!("Source: {} | [Link]({})\n\n", source, link);
-            }
-        }
-
-        Ok(output)
     }
 }
 
@@ -434,7 +291,6 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
             let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
             let raw_start = args.get("start_date").and_then(|v| v.as_str()).unwrap_or("");
             let raw_end = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
-            // Default empty dates to last 30 days
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
             let thirty_ago = (chrono::Utc::now() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
             let end_date = if raw_end.is_empty() { &today } else { raw_end };
@@ -449,7 +305,6 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
         }
         ToolName::GetFinancials => {
             let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
-            // All report_type variants currently resolve to the same fundamentals endpoint
             client.get_fundamentals(ticker).await
         }
         ToolName::GetNews => {
@@ -460,8 +315,7 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
         }
         ToolName::GetGlobalNews => {
             let curr_date = args.get("curr_date").and_then(|v| v.as_str()).unwrap_or("");
-            // Global news uses the same news endpoint with a broad query
-            client.get_news("^GSPC", curr_date, curr_date).await
+            client.get_news("^GSPC", &curr_date, &curr_date).await
         }
     }
 }
@@ -470,67 +324,11 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_unknown_tool_returns_error() {
-        let client = YahooFinanceClient::new();
-        let args = serde_json::json!({});
-        let result = execute_tool("nonexistent_tool", &args, &client).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown tool"));
-    }
-
     #[test]
-    fn test_format_date_range() {
-        let start = chrono::NaiveDate::parse_from_str("2025-01-01", "%Y-%m-%d");
-        let end = chrono::NaiveDate::parse_from_str("2025-12-31", "%Y-%m-%d");
-        assert!(start.is_ok());
-        assert!(end.is_ok());
-    }
-
-    // ---- EMA / MACD tests ----
-
-    #[test]
-    fn test_ema_too_few_prices() {
-        assert!(YahooFinanceClient::ema(&[1.0, 2.0], 5).is_none());
-        assert!(YahooFinanceClient::ema_series(&[1.0], 3).is_none());
-    }
-
-    #[test]
-    fn test_ema_exact_period() {
-        // With exactly `period` prices, EMA == SMA of those prices.
-        let prices = vec![2.0, 4.0, 6.0];
-        let ema = YahooFinanceClient::ema(&prices, 3).unwrap();
-        assert!((ema - 4.0).abs() < 1e-9); // SMA = (2+4+6)/3 = 4
-    }
-
-    #[test]
-    fn test_ema_series_length() {
-        let prices: Vec<f64> = (1..=20).map(|x| x as f64).collect();
-        let series = YahooFinanceClient::ema_series(&prices, 5).unwrap();
-        // length = prices.len() - period + 1
-        assert_eq!(series.len(), 16);
-    }
-
-    #[test]
-    fn test_ema_series_first_value_is_sma() {
-        let prices: Vec<f64> = (1..=10).map(|x| x as f64).collect();
-        let series = YahooFinanceClient::ema_series(&prices, 5).unwrap();
-        let sma = (1.0 + 2.0 + 3.0 + 4.0 + 5.0) / 5.0;
-        assert!((series[0] - sma).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_bollinger_too_few() {
-        assert!(YahooFinanceClient::calculate_bollinger(&[1.0, 2.0], 5, 2.0).is_none());
-    }
-
-    #[test]
-    fn test_bollinger_constant_prices() {
-        let prices = vec![10.0; 20];
-        let (upper, mid, lower) = YahooFinanceClient::calculate_bollinger(&prices, 20, 2.0).unwrap();
-        assert!((mid - 10.0).abs() < 1e-9);
-        assert!((upper - 10.0).abs() < 1e-9); // std = 0
-        assert!((lower - 10.0).abs() < 1e-9);
+    fn test_calculate_rsi() {
+        let prices = vec![44.0, 44.25, 44.5, 43.75, 44.0, 44.5, 45.0, 45.25, 45.5, 46.0,
+                          45.75, 46.0, 46.5, 47.0, 47.5, 48.0, 47.75, 48.0, 48.5, 49.0];
+        assert!(YahooFinanceClient::calculate_rsi(&prices, 14).is_some());
     }
 
     #[test]

@@ -27,29 +27,56 @@ async fn main() -> Result<()> {
     // Load .env file
     dotenvy::dotenv().ok();
 
-    // Get API credentials from environment
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .unwrap_or_else(|_| "sk-...".to_string());
-    let base_url = std::env::var("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string());
-    let quick_model = std::env::var("TAGENT_QUICK_MODEL")
-        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
-    let deep_model = std::env::var("TAGENT_DEEP_MODEL")
-        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    // Get LLM configuration from environment
+    // TAGENT_PROVIDER: "minimax" (default), "zai", "openai", "anthropic"
+    // Reads provider-specific keys: {MINIMAX,ZAI,OPENAI,ANTHROPIC}_{API_KEY,BASE_URL,MODEL}
+    // Falls back to TAGENT_API_KEY / TAGENT_BASE_URL / TAGENT_MODEL for ad-hoc overrides
+    let provider = std::env::var("TAGENT_PROVIDER")
+        .unwrap_or_else(|_| "minimax".to_string())
+        .to_lowercase();
 
-    tracing::info!("Initializing TAgent...");
+    let (api_key, base_url, default_model) = match provider.as_str() {
+        "minimax" => (
+            std::env::var("MINIMAX_API_KEY").unwrap_or_else(|_| "sk-...".to_string()),
+            std::env::var("MINIMAX_BASE_URL").unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string()),
+            "MiniMax-M2.7".to_string(),
+        ),
+        "zai" => (
+            std::env::var("ZAI_API_KEY").unwrap_or_else(|_| "sk-...".to_string()),
+            std::env::var("ZAI_BASE_URL").unwrap_or_else(|_| "https://api.z.ai/api/anthropic".to_string()),
+            "GLM-5.1".to_string(),
+        ),
+        "openai" => (
+            std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "sk-...".to_string()),
+            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1/messages".to_string()),
+            "gpt-4o".to_string(),
+        ),
+        _ => (
+            std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "sk-...".to_string()),
+            std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string()),
+            "claude-sonnet-4-6".to_string(),
+        ),
+    };
 
-    // Create LLM clients
-    // Using MiniMax's Anthropic-compatible endpoint (same as Python version)
+    // Ad-hoc overrides (highest priority)
+    let api_key = std::env::var("TAGENT_API_KEY").unwrap_or(api_key);
+    let base_url = std::env::var("TAGENT_BASE_URL").unwrap_or(base_url);
+    let default_model = std::env::var("TAGENT_MODEL").unwrap_or(default_model);
+
+    let quick_model = std::env::var("TAGENT_QUICK_MODEL").unwrap_or_else(|_| default_model.clone());
+    let deep_model = std::env::var("TAGENT_DEEP_MODEL").unwrap_or_else(|_| default_model);
+
+    tracing::info!("Initializing TAgent with provider={}, quick={}, deep={}", provider, quick_model, deep_model);
+
     let llm_quick = Arc::new(AnyLLMClient::new(
-        "anthropic",
+        &provider,
         &quick_model,
         &api_key,
         &base_url,
     ));
 
     let llm_deep = Arc::new(AnyLLMClient::new(
-        "anthropic",
+        &provider,
         &deep_model,
         &api_key,
         &base_url,

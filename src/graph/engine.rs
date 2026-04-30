@@ -4,7 +4,7 @@
 //! It routes between nodes based on conditional logic and maintains state.
 
 use crate::graph::state::{AgentState, InvestDebateState, RiskDebateState};
-use crate::llm::{LLMClient, Tool};
+use crate::llm::{AnthropicContentBlock, AnthropicMessage, LLMClient, Tool};
 use crate::memory::BM25Memory;
 use crate::tools::{ToolRegistry, ToolName};
 use crate::data::yfinance::{self, YahooFinanceClient};
@@ -568,48 +568,69 @@ impl GraphEngine {
     }
 
     // -------------------------------------------------------------------------
-    // Helper: Execute LLM with tool calling
+    // Helper: Execute LLM with tool calling (proper multi-turn message history)
     // -------------------------------------------------------------------------
 
     async fn execute_llm_with_tools(&self, prompt: &str, tools: &[Tool]) -> Result<String> {
         const MAX_ROUNDS: usize = 3;
-        let mut messages = prompt.to_string();
+
+        // Build proper message history: each user/assistant turn is a separate message.
+        // This allows the LLM to correctly attribute tool results to tool calls.
+        let mut messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicContentBlock::Text(prompt.to_string())],
+            }
+        ];
 
         for round in 0..MAX_ROUNDS {
-            let response = if round == 0 {
-                self.llm_quick.complete_with_tools(&messages, tools).await?
-            } else {
-                self.llm_quick.complete_with_tools(&messages, tools).await?
-            };
+            // Use complete_messages for proper Anthropic multi-turn format
+            let response = self.llm_quick.complete_messages(messages.clone(), tools).await?;
 
             let tool_calls = match response.tool_calls {
                 Some(tc) if !tc.is_empty() => tc,
                 _ => return Ok(response.content),
             };
 
-            let mut tool_results = Vec::new();
-            for tc in tool_calls {
+            // Add assistant message with tool_use blocks (one per tool call)
+            let assistant_blocks: Vec<AnthropicContentBlock> = tool_calls
+                .iter()
+                .enumerate()
+                .map(|(i, tc)| AnthropicContentBlock::ToolUse {
+                    id: format!("tc_{}_{}", round, i),
+                    name: tc.name.clone(),
+                    input: tc.arguments.clone(),
+                })
+                .collect();
+            messages.push(AnthropicMessage {
+                role: "assistant".to_string(),
+                content: assistant_blocks,
+            });
+
+            // Execute each tool and add tool_result messages (one per tool call)
+            for (i, tc) in tool_calls.iter().enumerate() {
+                let tool_use_id = format!("tc_{}_{}", round, i);
                 tracing::info!("Round {}: executing tool {}", round + 1, tc.name);
-                match yfinance::execute_tool(&tc.name, &tc.arguments, &self.yfinance).await {
-                    Ok(result) => tool_results.push(format!("Tool {} result: {}", tc.name, result)),
+                let result_content = match yfinance::execute_tool(&tc.name, &tc.arguments, &self.yfinance).await {
+                    Ok(result) => result,
                     Err(e) => {
                         tracing::warn!("Tool {} failed: {}", tc.name, e);
-                        tool_results.push(format!("Tool {} error: {}", tc.name, e));
+                        format!("error: {}", e)
                     }
-                }
+                };
+                messages.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![AnthropicContentBlock::ToolResult {
+                        tool_use_id,
+                        content: result_content,
+                    }],
+                });
             }
-
-            messages = format!(
-                "{}\n\nTool results (round {}):\n{}",
-                messages,
-                round + 1,
-                tool_results.join("\n")
-            );
         }
 
-        // Max rounds reached — ask LLM to summarize with what it has
-        let final_response = self.llm_quick.complete(&messages).await?;
-        Ok(final_response)
+        // Max rounds reached — final completion to synthesize with available data
+        let final_response = self.llm_quick.complete_messages(messages, tools).await?;
+        Ok(final_response.content)
     }
 }
 

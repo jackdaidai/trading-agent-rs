@@ -8,6 +8,62 @@ use std::future::Future;
 use std::pin::Pin;
 
 // =============================================================================
+// Types for Anthropic multi-turn message format
+// =============================================================================
+
+/// A single message in Anthropic message history format
+#[derive(Debug, Clone)]
+pub struct AnthropicMessage {
+    pub role: String,
+    pub content: Vec<AnthropicContentBlock>,
+}
+
+/// Content block types for Anthropic messages
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum AnthropicContentBlock {
+    /// Plain text content
+    Text(String),
+    /// Tool use request from assistant
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Tool result provided to assistant (user role)
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+impl From<AnthropicMessage> for Value {
+    fn from(msg: AnthropicMessage) -> Value {
+        let content: Vec<Value> = msg.content.into_iter().map(|b| b.into()).collect();
+        json!({
+            "role": msg.role,
+            "content": content,
+        })
+    }
+}
+
+impl From<AnthropicContentBlock> for Value {
+    fn from(block: AnthropicContentBlock) -> Value {
+        match block {
+            AnthropicContentBlock::Text(s) => json!({"type": "text", "text": s}),
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                json!({"type": "tool_use", "id": id, "name": name, "input": input})
+            }
+            AnthropicContentBlock::ToolResult { tool_use_id, content } => {
+                // Anthropic API: tool_result content is a string or nested content array
+                // For simplicity, use a structured object format
+                json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": content})
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Retry helper — exponential backoff on 429 / 5xx
 // =============================================================================
 
@@ -73,6 +129,7 @@ pub struct LLMResponse {
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
+    pub id: String,
     pub name: String,
     pub arguments: Value,
 }
@@ -85,6 +142,14 @@ pub trait LLMClient: Send + Sync {
 
     /// Send a completion request with tool definitions
     async fn complete_with_tools(&self, prompt: &str, tools: &[Tool]) -> Result<LLMResponse>;
+
+    /// Send a completion request with proper multi-turn message history.
+    /// Messages must include tool_result blocks for prior tool calls.
+    async fn complete_messages(
+        &self,
+        messages: Vec<AnthropicMessage>,
+        tools: &[Tool],
+    ) -> Result<LLMResponse>;
 
     /// Validate that the model is available
     fn validate_model(&self) -> bool;
@@ -173,6 +238,7 @@ impl LLMClient for OpenAIClient {
             tc.iter().map(|t| {
                 let args: Value = serde_json::from_str(t["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
                 ToolCall {
+                    id: t["id"].as_str().unwrap_or("").to_string(),
                     name: t["function"]["name"].as_str().unwrap_or("").to_string(),
                     arguments: args,
                 }
@@ -184,6 +250,33 @@ impl LLMClient for OpenAIClient {
             tool_calls,
             reasoning: None,
         })
+    }
+
+    async fn complete_messages(
+        &self,
+        messages: Vec<AnthropicMessage>,
+        tools: &[Tool],
+    ) -> Result<LLMResponse> {
+        // OpenAI doesn't use Anthropic multi-turn message format.
+        // Concatenate all text content into a flat prompt as a fallback.
+        let mut flat = String::new();
+        for msg in &messages {
+            flat.push_str(&format!("[{}] ", msg.role));
+            for block in &msg.content {
+                match block {
+                    AnthropicContentBlock::Text(s) => flat.push_str(s),
+                    AnthropicContentBlock::ToolUse { name, input, .. } => {
+                        flat.push_str(&format!("(tool call: {} with {:?})", name, input));
+                    }
+                    AnthropicContentBlock::ToolResult { content, .. } => {
+                        flat.push_str(&format!("(tool result: {})", content));
+                    }
+                }
+                flat.push_str("; ");
+            }
+            flat.push('\n');
+        }
+        self.complete_with_tools(&flat, tools).await
     }
 
     fn validate_model(&self) -> bool {
@@ -271,10 +364,93 @@ impl LLMClient for AnthropicClient {
                 match block["type"].as_str().unwrap_or("") {
                     "text" => content.push_str(block["text"].as_str().unwrap_or("")),
                     "tool_use" => {
-                        let args: Value = serde_json::from_str(
-                            block["input"].as_str().unwrap_or("{}")
-                        ).unwrap_or(json!({}));
+                        let id = block["id"].as_str().unwrap_or("").to_string();
+                        let args: Value = block.get("input").cloned().unwrap_or(json!({}));
                         tool_calls.push(ToolCall {
+                            id,
+                            name: block["name"].as_str().unwrap_or("").to_string(),
+                            arguments: args,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(LLMResponse {
+            content,
+            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            reasoning: None,
+        })
+    }
+
+    async fn complete_messages(
+        &self,
+        messages: Vec<AnthropicMessage>,
+        tools: &[Tool],
+    ) -> Result<LLMResponse> {
+        // Build Anthropic API message format with proper content blocks
+        let api_messages: Vec<Value> = messages
+            .into_iter()
+            .map(|m| {
+                let content: Vec<Value> = m
+                    .content
+                    .into_iter()
+                    .map(|b| b.into())
+                    .collect();
+                json!({
+                    "role": m.role,
+                    "content": content,
+                })
+            })
+            .collect();
+
+        let mut body = json!({
+            "model": self.model,
+            "messages": api_messages,
+            "max_tokens": 4096,
+        });
+
+        if !tools.is_empty() {
+            body["tools"] = json!(tools.iter().map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            }).collect::<Vec<_>>());
+            body["thinking"] = json!({"type": "disabled"});
+        }
+
+        let resp_json = retry_request(|| {
+            let client = self.client.clone();
+            let url = format!("{}/v1/messages", self.base_url);
+            let key = self.api_key.clone();
+            let body = body.clone();
+            Box::pin(async move {
+                client.post(&url)
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+            })
+        }).await?;
+
+        // Extract content blocks
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+
+        if let Some(blocks) = resp_json["content"].as_array() {
+            for block in blocks {
+                match block["type"].as_str().unwrap_or("") {
+                    "text" => content.push_str(block["text"].as_str().unwrap_or("")),
+                    "tool_use" => {
+                        let id = block["id"].as_str().unwrap_or("").to_string();
+                        let args: Value = block.get("input").cloned().unwrap_or(json!({}));
+                        tool_calls.push(ToolCall {
+                            id,
                             name: block["name"].as_str().unwrap_or("").to_string(),
                             arguments: args,
                         });
@@ -312,8 +488,8 @@ pub enum AnyLLMClient {
 impl AnyLLMClient {
     pub fn new(provider: &str, model: &str, api_key: &str, base_url: &str) -> Self {
         match provider.to_lowercase().as_str() {
-            "anthropic" | "minimax" => {
-                // MiniMax uses Anthropic-compatible API
+            "anthropic" | "minimax" | "zai" => {
+                // MiniMax and z.ai use Anthropic-compatible API
                 Self::Anthropic(AnthropicClient::new(model, api_key, base_url))
             }
             _ => Self::OpenAI(OpenAIClient::new(model, api_key, base_url)),
@@ -334,6 +510,17 @@ impl LLMClient for AnyLLMClient {
         match self {
             Self::OpenAI(c) => c.complete_with_tools(prompt, tools).await,
             Self::Anthropic(c) => c.complete_with_tools(prompt, tools).await,
+        }
+    }
+
+    async fn complete_messages(
+        &self,
+        messages: Vec<AnthropicMessage>,
+        tools: &[Tool],
+    ) -> Result<LLMResponse> {
+        match self {
+            Self::OpenAI(c) => c.complete_messages(messages, tools).await,
+            Self::Anthropic(c) => c.complete_messages(messages, tools).await,
         }
     }
 
