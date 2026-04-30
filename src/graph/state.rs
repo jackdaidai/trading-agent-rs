@@ -81,7 +81,10 @@ impl AgentState {
             self.market_report.chars().take(200).collect::<String>(),
             self.sentiment_report.chars().take(200).collect::<String>(),
             self.news_report.chars().take(200).collect::<String>(),
-            self.fundamentals_report.chars().take(200).collect::<String>(),
+            self.fundamentals_report
+                .chars()
+                .take(200)
+                .collect::<String>(),
         )
     }
 }

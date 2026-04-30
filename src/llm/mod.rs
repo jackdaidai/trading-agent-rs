@@ -1,11 +1,11 @@
 //! LLM Client abstraction for multiple providers (OpenAI, Anthropic, MiniMax, etc.)
 
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use anyhow::{Result, Context, bail};
-use std::time::Duration;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 // =============================================================================
 // Types for Anthropic multi-turn message format
@@ -54,7 +54,10 @@ impl From<AnthropicContentBlock> for Value {
             AnthropicContentBlock::ToolUse { id, name, input } => {
                 json!({"type": "tool_use", "id": id, "name": name, "input": input})
             }
-            AnthropicContentBlock::ToolResult { tool_use_id, content } => {
+            AnthropicContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
                 // Anthropic API: tool_result content is a string or nested content array
                 // For simplicity, use a structured object format
                 json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": content})
@@ -70,8 +73,26 @@ impl From<AnthropicContentBlock> for Value {
 const MAX_RETRIES: u32 = 3;
 const BASE_DELAY_MS: u64 = 1000;
 
+fn endpoint_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let suffix = path.trim_start_matches('/');
+    if base.ends_with(suffix) {
+        base.to_string()
+    } else if let Some(versionless_suffix) = suffix.strip_prefix("v1/") {
+        if base.ends_with("/v1") {
+            format!("{}/{}", base, versionless_suffix)
+        } else {
+            format!("{}/{}", base, suffix)
+        }
+    } else {
+        format!("{}/{}", base, suffix)
+    }
+}
+
 async fn retry_request(
-    build_request: impl Fn() -> Pin<Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Send>>,
+    build_request: impl Fn() -> Pin<
+        Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Send>,
+    >,
 ) -> Result<Value> {
     for attempt in 0..=MAX_RETRIES {
         let resp = build_request().await;
@@ -80,7 +101,12 @@ async fn retry_request(
             Ok(r) => r,
             Err(e) if attempt < MAX_RETRIES => {
                 let delay = BASE_DELAY_MS * 2u64.pow(attempt);
-                tracing::warn!("Request error (attempt {}): {}. Retrying in {}ms", attempt + 1, e, delay);
+                tracing::warn!(
+                    "Request error (attempt {}): {}. Retrying in {}ms",
+                    attempt + 1,
+                    e,
+                    delay
+                );
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 continue;
             }
@@ -91,7 +117,12 @@ async fn retry_request(
         if status == 429 || status.is_server_error() {
             if attempt < MAX_RETRIES {
                 let delay = BASE_DELAY_MS * 2u64.pow(attempt);
-                tracing::warn!("HTTP {} (attempt {}). Retrying in {}ms", status, attempt + 1, delay);
+                tracing::warn!(
+                    "HTTP {} (attempt {}). Retrying in {}ms",
+                    status,
+                    attempt + 1,
+                    delay
+                );
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 continue;
             }
@@ -108,7 +139,6 @@ async fn retry_request(
     }
     unreachable!()
 }
-
 
 /// Tool definition for LLM tool calling
 #[derive(Debug, Clone)]
@@ -199,33 +229,37 @@ impl LLMClient for OpenAIClient {
 
         // Add tool definitions if provided
         if !tools.is_empty() {
-            body["tools"] = json!(tools.iter().map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
+            body["tools"] = json!(tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
                 })
-            }).collect::<Vec<_>>());
+                .collect::<Vec<_>>());
         }
 
         let resp_json = retry_request(|| {
             let client = self.client.clone();
-            let url = format!("{}/v1/messages", self.base_url);
+            let url = endpoint_url(&self.base_url, "/v1/chat/completions");
             let key = self.api_key.clone();
             let body = body.clone();
             Box::pin(async move {
-                client.post(&url)
-                    .header("x-api-key", key)
-                    .header("anthropic-version", "2023-06-01")
+                client
+                    .post(&url)
+                    .bearer_auth(key)
                     .header("content-type", "application/json")
                     .json(&body)
                     .send()
                     .await
             })
-        }).await?;
+        })
+        .await?;
 
         // Extract content
         let content = resp_json["choices"][0]["message"]["content"]
@@ -234,16 +268,23 @@ impl LLMClient for OpenAIClient {
             .to_string();
 
         // Extract tool calls if present
-        let tool_calls = resp_json["choices"][0]["message"]["tool_calls"].as_array().map(|tc| {
-            tc.iter().map(|t| {
-                let args: Value = serde_json::from_str(t["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
-                ToolCall {
-                    id: t["id"].as_str().unwrap_or("").to_string(),
-                    name: t["function"]["name"].as_str().unwrap_or("").to_string(),
-                    arguments: args,
-                }
-            }).collect()
-        });
+        let tool_calls = resp_json["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .map(|tc| {
+                tc.iter()
+                    .map(|t| {
+                        let args: Value = serde_json::from_str(
+                            t["function"]["arguments"].as_str().unwrap_or("{}"),
+                        )
+                        .unwrap_or(json!({}));
+                        ToolCall {
+                            id: t["id"].as_str().unwrap_or("").to_string(),
+                            name: t["function"]["name"].as_str().unwrap_or("").to_string(),
+                            arguments: args,
+                        }
+                    })
+                    .collect()
+            });
 
         Ok(LLMResponse {
             content,
@@ -329,23 +370,27 @@ impl LLMClient for AnthropicClient {
 
         // Add tool definitions if provided
         if !tools.is_empty() {
-            body["tools"] = json!(tools.iter().map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.parameters,
+            body["tools"] = json!(tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.parameters,
+                    })
                 })
-            }).collect::<Vec<_>>());
+                .collect::<Vec<_>>());
             body["thinking"] = json!({"type": "disabled"});
         }
 
         let resp_json = retry_request(|| {
             let client = self.client.clone();
-            let url = format!("{}/v1/messages", self.base_url);
+            let url = endpoint_url(&self.base_url, "/v1/messages");
             let key = self.api_key.clone();
             let body = body.clone();
             Box::pin(async move {
-                client.post(&url)
+                client
+                    .post(&url)
                     .header("x-api-key", key)
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
@@ -353,7 +398,8 @@ impl LLMClient for AnthropicClient {
                     .send()
                     .await
             })
-        }).await?;
+        })
+        .await?;
 
         // Extract content blocks
         let mut content = String::new();
@@ -379,7 +425,11 @@ impl LLMClient for AnthropicClient {
 
         Ok(LLMResponse {
             content,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
             reasoning: None,
         })
     }
@@ -393,11 +443,7 @@ impl LLMClient for AnthropicClient {
         let api_messages: Vec<Value> = messages
             .into_iter()
             .map(|m| {
-                let content: Vec<Value> = m
-                    .content
-                    .into_iter()
-                    .map(|b| b.into())
-                    .collect();
+                let content: Vec<Value> = m.content.into_iter().map(|b| b.into()).collect();
                 json!({
                     "role": m.role,
                     "content": content,
@@ -412,23 +458,27 @@ impl LLMClient for AnthropicClient {
         });
 
         if !tools.is_empty() {
-            body["tools"] = json!(tools.iter().map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.parameters,
+            body["tools"] = json!(tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.parameters,
+                    })
                 })
-            }).collect::<Vec<_>>());
+                .collect::<Vec<_>>());
             body["thinking"] = json!({"type": "disabled"});
         }
 
         let resp_json = retry_request(|| {
             let client = self.client.clone();
-            let url = format!("{}/v1/messages", self.base_url);
+            let url = endpoint_url(&self.base_url, "/v1/messages");
             let key = self.api_key.clone();
             let body = body.clone();
             Box::pin(async move {
-                client.post(&url)
+                client
+                    .post(&url)
                     .header("x-api-key", key)
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
@@ -436,7 +486,8 @@ impl LLMClient for AnthropicClient {
                     .send()
                     .await
             })
-        }).await?;
+        })
+        .await?;
 
         // Extract content blocks
         let mut content = String::new();
@@ -462,7 +513,11 @@ impl LLMClient for AnthropicClient {
 
         Ok(LLMResponse {
             content,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
             reasoning: None,
         })
     }
@@ -536,5 +591,29 @@ impl LLMClient for AnyLLMClient {
             Self::OpenAI(c) => c.provider_name(),
             Self::Anthropic(c) => c.provider_name(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_url;
+
+    #[test]
+    fn endpoint_url_avoids_duplicate_version_path() {
+        assert_eq!(
+            endpoint_url("https://api.openai.com", "/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url("https://api.openai.com/v1", "/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url(
+                "https://api.openai.com/v1/chat/completions",
+                "/v1/chat/completions"
+            ),
+            "https://api.openai.com/v1/chat/completions"
+        );
     }
 }

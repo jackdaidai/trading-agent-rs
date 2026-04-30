@@ -4,3 +4,11 @@
 *.exe
 
 /target-rel
+
+# Generated analysis outputs
+/reports/
+batch-*.txt
+benchmark-*.txt
+
+# Local scratch helpers
+inspect_git.py

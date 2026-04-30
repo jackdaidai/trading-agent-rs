@@ -64,7 +64,10 @@ impl BM25Memory {
     /// Persist current entries to a JSON file.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let store = MemoryStore {
-            entries: self.documents.iter().zip(self.recommendations.iter())
+            entries: self
+                .documents
+                .iter()
+                .zip(self.recommendations.iter())
                 .map(|(s, r)| MemoryEntry {
                     situation: s.clone(),
                     recommendation: r.clone(),
@@ -81,7 +84,8 @@ impl BM25Memory {
 
     /// Tokenize text into words (simple ASCII tokenizer)
     fn tokenize(&self, text: &str) -> Vec<String> {
-        WORD_RE.find_iter(text)
+        WORD_RE
+            .find_iter(text)
             .map(|m| m.as_str().to_lowercase())
             .collect()
     }
@@ -114,7 +118,8 @@ impl BM25Memory {
             }
         }
 
-        self.idf = df.iter()
+        self.idf = df
+            .iter()
             .map(|(term, &df)| {
                 let idf = ((n - df + 0.5) / (df + 0.5)).max(1.0).ln();
                 (term.clone(), idf)
@@ -136,14 +141,17 @@ impl BM25Memory {
             return Vec::new();
         }
 
-        let mut scores: Vec<(usize, f64)> = self.tokenized_docs.iter()
+        let mut scores: Vec<(usize, f64)> = self
+            .tokenized_docs
+            .iter()
             .enumerate()
             .map(|(i, doc)| (i, self.bm25_score(doc, &query_tokens)))
             .collect();
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        scores.iter()
+        scores
+            .iter()
             .take(n_matches)
             .map(|(idx, score)| {
                 let normalized_score = (score / 10.0).clamp(0.0, 1.0);

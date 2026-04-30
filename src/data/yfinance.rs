@@ -4,10 +4,10 @@
 //! Yahoo Finance requires cookie/crumb session for some tickers.
 //! Using Python yfinance library handles this automatically.
 
-use serde::{Deserialize, Serialize};
-use anyhow::{Result, Context};
-use std::process::Command;
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
+use std::process::Command;
 
 /// Stock quote data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +62,9 @@ pub struct YahooFinanceClient {
 
 impl YahooFinanceClient {
     pub fn new() -> Self {
-        // Default proxy path — can be overridden via constructor
         Self {
-            proxy_path: String::new(),
+            proxy_path: std::env::var("TAGENT_YFINANCE_PROXY")
+                .unwrap_or_else(|_| "yfinance_proxy.py".to_string()),
         }
     }
 
@@ -75,27 +75,18 @@ impl YahooFinanceClient {
     }
 
     fn proxy_path(&self) -> &str {
-        if self.proxy_path.is_empty() {
-            "yfinance_proxy.py"
-        } else {
-            &self.proxy_path
-        }
+        &self.proxy_path
     }
 
     /// Call Python yfinance proxy and parse JSON output
     fn call_proxy(&self, action: &str, args: &[&str]) -> Result<serde_json::Value> {
         let mut cmd = Command::new("python");
-        if cfg!(windows) {
-            cmd.args(["yfinance_proxy.py", action]);
-        } else {
-            cmd.args(["yfinance_proxy.py", action]);
-        }
+        cmd.arg(self.proxy_path()).arg(action);
         cmd.args(args);
 
         let output = cmd
-            .current_dir("C:/Users/jiehu/dev/tagent")
             .output()
-            .context("Failed to run yfinance proxy")?;
+            .with_context(|| format!("Failed to run yfinance proxy at {}", self.proxy_path()))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -103,8 +94,8 @@ impl YahooFinanceClient {
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
-        let json: serde_json::Value = serde_json::from_str(&json_str)
-            .context("Failed to parse yfinance proxy JSON")?;
+        let json: serde_json::Value =
+            serde_json::from_str(&json_str).context("Failed to parse yfinance proxy JSON")?;
 
         if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
             anyhow::bail!("yfinance proxy error: {}", err);
@@ -114,10 +105,16 @@ impl YahooFinanceClient {
     }
 
     /// Fetch stock data for a date range
-    pub async fn get_stock_data(&self, symbol: &str, start_date: &str, end_date: &str) -> Result<String> {
+    pub async fn get_stock_data(
+        &self,
+        symbol: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<String> {
         let json = self.call_proxy("get_stock_data", &[symbol, start_date, end_date])?;
 
-        let records = json.get("records")
+        let records = json
+            .get("records")
             .and_then(|v| v.as_array())
             .context("No records in yfinance response")?;
 
@@ -133,20 +130,26 @@ impl YahooFinanceClient {
             let close = record.get("close").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let volume = record.get("volume").and_then(|v| v.as_i64()).unwrap_or(0);
 
-            output += &format!("| {} | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
-                date, open, high, low, close, volume);
+            output += &format!(
+                "| {} | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
+                date, open, high, low, close, volume
+            );
         }
 
         Ok(output)
     }
 
     /// Fetch technical indicators
-    pub async fn get_indicators(&self, symbol: &str, curr_date: &str, look_back_days: i32) -> Result<String> {
-        let json = self.call_proxy("get_indicators", &[
-            symbol,
-            curr_date,
-            &look_back_days.to_string(),
-        ])?;
+    pub async fn get_indicators(
+        &self,
+        symbol: &str,
+        curr_date: &str,
+        look_back_days: i32,
+    ) -> Result<String> {
+        let json = self.call_proxy(
+            "get_indicators",
+            &[symbol, curr_date, &look_back_days.to_string()],
+        )?;
 
         let mut output = format!("## {} Technical Indicators\n\n", symbol);
 
@@ -219,7 +222,8 @@ impl YahooFinanceClient {
     pub async fn get_news(&self, ticker: &str, start_date: &str, end_date: &str) -> Result<String> {
         let json = self.call_proxy("get_news", &[ticker, start_date, end_date])?;
 
-        let articles = json.get("articles")
+        let articles = json
+            .get("articles")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
@@ -227,8 +231,14 @@ impl YahooFinanceClient {
         let mut output = "## Recent News\n\n".to_string();
 
         for (i, article) in articles.iter().enumerate().take(10) {
-            let title = article.get("title").and_then(|v| v.as_str()).unwrap_or("N/A");
-            let source = article.get("source").and_then(|v| v.as_str()).unwrap_or("N/A");
+            let title = article
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("N/A");
+            let source = article
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("N/A");
             let link = article.get("link").and_then(|v| v.as_str()).unwrap_or("#");
 
             output += &format!("### {}. {}\n", i + 1, title);
@@ -243,7 +253,11 @@ impl YahooFinanceClient {
     fn date_to_timestamp(date_str: &str) -> Result<i64> {
         let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
             .with_context(|| format!("Invalid date format: {}", date_str))?;
-        Ok(date.and_hms_opt(0, 0, 0).expect("valid hms").and_utc().timestamp())
+        Ok(date
+            .and_hms_opt(0, 0, 0)
+            .expect("valid hms")
+            .and_utc()
+            .timestamp())
     }
 
     #[allow(dead_code)]
@@ -254,7 +268,7 @@ impl YahooFinanceClient {
         let mut gains = Vec::new();
         let mut losses = Vec::new();
         for i in 1..prices.len() {
-            let diff = prices[i] - prices[i-1];
+            let diff = prices[i] - prices[i - 1];
             if diff > 0.0 {
                 gains.push(diff);
                 losses.push(0.0);
@@ -280,7 +294,11 @@ impl Default for YahooFinanceClient {
 }
 
 /// Tool execution router - routes tool calls to appropriate data sources
-pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &YahooFinanceClient) -> Result<String> {
+pub async fn execute_tool(
+    tool_name: &str,
+    args: &serde_json::Value,
+    client: &YahooFinanceClient,
+) -> Result<String> {
     use crate::tools::ToolName;
 
     let tool = ToolName::from_str(tool_name)
@@ -289,18 +307,30 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
     match tool {
         ToolName::GetStockData => {
             let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            let raw_start = args.get("start_date").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_start = args
+                .get("start_date")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let raw_end = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            let thirty_ago = (chrono::Utc::now() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+            let thirty_ago = (chrono::Utc::now() - chrono::Duration::days(30))
+                .format("%Y-%m-%d")
+                .to_string();
             let end_date = if raw_end.is_empty() { &today } else { raw_end };
-            let start_date = if raw_start.is_empty() { &thirty_ago } else { raw_start };
+            let start_date = if raw_start.is_empty() {
+                &thirty_ago
+            } else {
+                raw_start
+            };
             client.get_stock_data(symbol, start_date, end_date).await
         }
         ToolName::GetIndicators => {
             let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
             let curr_date = args.get("curr_date").and_then(|v| v.as_str()).unwrap_or("");
-            let look_back = args.get("look_back_days").and_then(|v| v.as_i64()).unwrap_or(30) as i32;
+            let look_back = args
+                .get("look_back_days")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(30) as i32;
             client.get_indicators(symbol, curr_date, look_back).await
         }
         ToolName::GetFinancials => {
@@ -309,13 +339,16 @@ pub async fn execute_tool(tool_name: &str, args: &serde_json::Value, client: &Ya
         }
         ToolName::GetNews => {
             let ticker = args.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
-            let start_date = args.get("start_date").and_then(|v| v.as_str()).unwrap_or("");
+            let start_date = args
+                .get("start_date")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let end_date = args.get("end_date").and_then(|v| v.as_str()).unwrap_or("");
             client.get_news(ticker, start_date, end_date).await
         }
         ToolName::GetGlobalNews => {
             let curr_date = args.get("curr_date").and_then(|v| v.as_str()).unwrap_or("");
-            client.get_news("^GSPC", &curr_date, &curr_date).await
+            client.get_news("^GSPC", curr_date, curr_date).await
         }
     }
 }
@@ -326,8 +359,10 @@ mod tests {
 
     #[test]
     fn test_calculate_rsi() {
-        let prices = vec![44.0, 44.25, 44.5, 43.75, 44.0, 44.5, 45.0, 45.25, 45.5, 46.0,
-                          45.75, 46.0, 46.5, 47.0, 47.5, 48.0, 47.75, 48.0, 48.5, 49.0];
+        let prices = vec![
+            44.0, 44.25, 44.5, 43.75, 44.0, 44.5, 45.0, 45.25, 45.5, 46.0, 45.75, 46.0, 46.5, 47.0,
+            47.5, 48.0, 47.75, 48.0, 48.5, 49.0,
+        ];
         assert!(YahooFinanceClient::calculate_rsi(&prices, 14).is_some());
     }
 
@@ -336,5 +371,11 @@ mod tests {
         let ts = YahooFinanceClient::date_to_timestamp("2025-01-01").unwrap();
         assert!(ts > 0);
         assert!(YahooFinanceClient::date_to_timestamp("not-a-date").is_err());
+    }
+
+    #[test]
+    fn test_proxy_path_override() {
+        let client = YahooFinanceClient::with_proxy_path("custom_proxy.py");
+        assert_eq!(client.proxy_path(), "custom_proxy.py");
     }
 }

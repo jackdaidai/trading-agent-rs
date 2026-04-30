@@ -2,26 +2,30 @@
 //!
 //! A high-performance Rust rewrite of TradingAgents with parallel execution.
 
-mod llm;
+mod data;
 mod graph;
+mod llm;
 mod memory;
 mod tools;
-mod data;
 
-use crate::graph::engine::{GraphEngine, GraphConfig};
+use crate::graph::engine::{GraphConfig, GraphEngine};
 use crate::graph::state::AgentState;
 use crate::llm::{AnyLLMClient, LLMClient};
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const FINANCIAL_DISCLAIMER: &str = "For research and education only. Not financial advice, investment advice, or a recommendation to buy, sell, or hold any security.";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("tagent=info".parse()?))
+        .with(
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("tagent=info".parse()?),
+        )
         .init();
 
     // Load .env file
@@ -35,26 +39,38 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "minimax".to_string())
         .to_lowercase();
 
-    let (api_key, base_url, default_model) = match provider.as_str() {
+    let (api_key, base_url, default_model, api_key_env) = match provider.as_str() {
         "minimax" => (
-            std::env::var("MINIMAX_API_KEY").unwrap_or_else(|_| "sk-...".to_string()),
-            std::env::var("MINIMAX_BASE_URL").unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string()),
+            std::env::var("MINIMAX_API_KEY").unwrap_or_default(),
+            std::env::var("MINIMAX_BASE_URL")
+                .unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string()),
             "MiniMax-M2.7".to_string(),
+            "MINIMAX_API_KEY",
         ),
         "zai" => (
-            std::env::var("ZAI_API_KEY").unwrap_or_else(|_| "sk-...".to_string()),
-            std::env::var("ZAI_BASE_URL").unwrap_or_else(|_| "https://api.z.ai/api/anthropic".to_string()),
+            std::env::var("ZAI_API_KEY").unwrap_or_default(),
+            std::env::var("ZAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.z.ai/api/anthropic".to_string()),
             "GLM-5.1".to_string(),
+            "ZAI_API_KEY",
         ),
         "openai" => (
-            std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "sk-...".to_string()),
-            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1/messages".to_string()),
+            std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com".to_string()),
             "gpt-4o".to_string(),
+            "OPENAI_API_KEY",
         ),
-        _ => (
-            std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "sk-...".to_string()),
-            std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string()),
+        "anthropic" => (
+            std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+            std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
             "claude-sonnet-4-6".to_string(),
+            "ANTHROPIC_API_KEY",
+        ),
+        other => bail!(
+            "Unsupported TAGENT_PROVIDER '{}'. Expected minimax, zai, openai, or anthropic.",
+            other
         ),
     };
 
@@ -64,9 +80,28 @@ async fn main() -> Result<()> {
     let default_model = std::env::var("TAGENT_MODEL").unwrap_or(default_model);
 
     let quick_model = std::env::var("TAGENT_QUICK_MODEL").unwrap_or_else(|_| default_model.clone());
-    let deep_model = std::env::var("TAGENT_DEEP_MODEL").unwrap_or_else(|_| default_model);
+    let deep_model = std::env::var("TAGENT_DEEP_MODEL").unwrap_or(default_model);
 
-    tracing::info!("Initializing TAgent with provider={}, quick={}, deep={}", provider, quick_model, deep_model);
+    if api_key.trim().is_empty() {
+        bail!(
+            "Missing API key for provider '{}'. Set TAGENT_API_KEY or {}.",
+            provider,
+            api_key_env
+        );
+    }
+    if base_url.trim().is_empty() {
+        bail!("Missing base URL for provider '{}'. Set TAGENT_BASE_URL or the provider-specific base URL.", provider);
+    }
+    if quick_model.trim().is_empty() || deep_model.trim().is_empty() {
+        bail!("Missing LLM model name. Set TAGENT_MODEL or both TAGENT_QUICK_MODEL and TAGENT_DEEP_MODEL.");
+    }
+
+    tracing::info!(
+        "Initializing TAgent with provider={}, quick={}, deep={}",
+        provider,
+        quick_model,
+        deep_model
+    );
 
     let llm_quick = Arc::new(AnyLLMClient::new(
         &provider,
@@ -112,14 +147,20 @@ async fn main() -> Result<()> {
         if date_re.is_match(&args[0]) {
             (vec!["NVDA".to_string()], args[0].clone())
         } else {
-            (vec![args[0].clone()], chrono::Local::now().format("%Y-%m-%d").to_string())
+            (
+                vec![args[0].clone()],
+                chrono::Local::now().format("%Y-%m-%d").to_string(),
+            )
         }
     } else {
         let last = args.last().unwrap();
         if date_re.is_match(last) {
-            (args[..args.len()-1].to_vec(), last.clone())
+            (args[..args.len() - 1].to_vec(), last.clone())
         } else {
-            (args.clone(), chrono::Local::now().format("%Y-%m-%d").to_string())
+            (
+                args.clone(),
+                chrono::Local::now().format("%Y-%m-%d").to_string(),
+            )
         }
     };
 
@@ -136,11 +177,15 @@ async fn main() -> Result<()> {
             validates.push(tokio::spawn(async move {
                 // Use recent 5-day window for validation
                 let today = chrono::Utc::now().date_naive();
-                let start = (today - chrono::Duration::days(5)).format("%Y-%m-%d").to_string();
+                let start = (today - chrono::Duration::days(5))
+                    .format("%Y-%m-%d")
+                    .to_string();
                 let end = today.format("%Y-%m-%d").to_string();
                 let prices = yf.get_stock_data(&t, &start, &end).await;
                 match prices {
-                    Ok(p) if p.is_empty() => Err(anyhow::anyhow!("Ticker '{}' returned no data", t)),
+                    Ok(p) if p.is_empty() => {
+                        Err(anyhow::anyhow!("Ticker '{}' returned no data", t))
+                    }
                     Err(e) => Err(anyhow::anyhow!("Cannot fetch data for '{}': {}", t, e)),
                     _ => Ok(t),
                 }
@@ -165,12 +210,20 @@ async fn main() -> Result<()> {
         print_and_save(ticker, &trade_date, &result.final_trade_decision, elapsed)?;
     } else {
         let total_start = std::time::Instant::now();
+        let batch_concurrency = batch_concurrency()?;
+        tracing::info!("Batch concurrency: {}", batch_concurrency);
+        let limiter = Arc::new(Semaphore::new(batch_concurrency));
         let mut handles = Vec::new();
         for ticker in &tickers {
             let engine = engine.clone();
+            let limiter = limiter.clone();
             let ticker = ticker.clone();
             let trade_date = trade_date.clone();
             handles.push(tokio::spawn(async move {
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .context("Batch concurrency limiter closed")?;
                 let state = AgentState::new(&ticker, &trade_date);
                 let start = std::time::Instant::now();
                 let result = engine.run(state).await?;
@@ -190,7 +243,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        println!("\n[Batch total: {:.0}s]", total_start.elapsed().as_secs_f64());
+        println!(
+            "\n[Batch total: {:.0}s]",
+            total_start.elapsed().as_secs_f64()
+        );
         if any_failed {
             anyhow::bail!("One or more analyses failed");
         }
@@ -199,10 +255,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_and_save(ticker: &str, trade_date: &str, decision: &str, elapsed: std::time::Duration) -> Result<()> {
+fn batch_concurrency() -> Result<usize> {
+    match std::env::var("TAGENT_BATCH_CONCURRENCY") {
+        Ok(value) => {
+            let parsed = value
+                .parse::<usize>()
+                .with_context(|| format!("Invalid TAGENT_BATCH_CONCURRENCY '{}'", value))?;
+            if parsed == 0 {
+                bail!("TAGENT_BATCH_CONCURRENCY must be at least 1");
+            }
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(1),
+        Err(e) => Err(e).context("Invalid TAGENT_BATCH_CONCURRENCY"),
+    }
+}
+
+fn print_and_save(
+    ticker: &str,
+    trade_date: &str,
+    decision: &str,
+    elapsed: std::time::Duration,
+) -> Result<()> {
     println!("\n{}", "=".repeat(60));
     println!("FINAL DECISION FOR {} ON {}", ticker, trade_date);
     println!("{}", "=".repeat(60));
+    println!("\nDisclaimer: {}", FINANCIAL_DISCLAIMER);
     println!("\n{}", decision);
     println!("\n[Completed in {:.0}s]", elapsed.as_secs_f64());
 
@@ -211,8 +289,12 @@ fn print_and_save(ticker: &str, trade_date: &str, decision: &str, elapsed: std::
     let filename = format!("{}_{}.md", ticker, trade_date);
     let report_path = reports_dir.join(&filename);
     let report = format!(
-        "# {} Analysis — {}\n\n**Completed in {:.0}s**\n\n{}\n",
-        ticker, trade_date, elapsed.as_secs_f64(), decision
+        "# {} Analysis — {}\n\n> {}\n\n**Completed in {:.0}s**\n\n{}\n",
+        ticker,
+        trade_date,
+        FINANCIAL_DISCLAIMER,
+        elapsed.as_secs_f64(),
+        decision
     );
     std::fs::write(&report_path, &report)?;
     tracing::info!("Report saved to {}", report_path.display());

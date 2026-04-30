@@ -3,15 +3,14 @@
 //! This is a simple state machine that replaces LangGraph's StateGraph.
 //! It routes between nodes based on conditional logic and maintains state.
 
+use crate::data::yfinance::{self, YahooFinanceClient};
 use crate::graph::state::{AgentState, InvestDebateState, RiskDebateState};
 use crate::llm::{AnthropicContentBlock, AnthropicMessage, LLMClient, Tool};
 use crate::memory::BM25Memory;
-use crate::tools::{ToolRegistry, ToolName};
-use crate::data::yfinance::{self, YahooFinanceClient};
+use crate::tools::{ToolName, ToolRegistry};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
 
 // =============================================================================
 // Graph Configuration
@@ -158,7 +157,11 @@ impl GraphEngine {
         // Compute a 30-day lookback for stock data
         let end = date;
         let start = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .map(|d| (d - chrono::Duration::days(30)).format("%Y-%m-%d").to_string())
+            .map(|d| {
+                (d - chrono::Duration::days(30))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
             .unwrap_or_else(|_| date.to_string());
         let prompt = format!(
             r#"You are a market analyst. Analyze the stock data for {ticker} on {date}.
@@ -295,7 +298,11 @@ impl GraphEngine {
                 sentiment = state.sentiment_report,
                 news = state.news_report,
                 fundamentals = state.fundamentals_report,
-                prior = if prior_history.is_empty() { String::new() } else { format!("Prior debate:\n{}", prior_history) },
+                prior = if prior_history.is_empty() {
+                    String::new()
+                } else {
+                    format!("Prior debate:\n{}", prior_history)
+                },
             );
 
             let bear_prompt = format!(
@@ -322,7 +329,11 @@ impl GraphEngine {
                 sentiment = state.sentiment_report,
                 news = state.news_report,
                 fundamentals = state.fundamentals_report,
-                prior = if prior_history.is_empty() { String::new() } else { format!("Prior debate:\n{}", prior_history) },
+                prior = if prior_history.is_empty() {
+                    String::new()
+                } else {
+                    format!("Prior debate:\n{}", prior_history)
+                },
             );
 
             let (bull_response, bear_response) = tokio::try_join!(
@@ -330,9 +341,18 @@ impl GraphEngine {
                 self.llm_quick.complete(&bear_prompt),
             )?;
 
-            debate_state.bull_history.push_str(&format!("\nBull: {}", bull_response));
-            debate_state.bear_history.push_str(&format!("\nBear: {}", bear_response));
-            debate_state.history.push_str(&format!("Round {} Bull: {} Bear: {}", round + 1, bull_response, bear_response));
+            debate_state
+                .bull_history
+                .push_str(&format!("\nBull: {}", bull_response));
+            debate_state
+                .bear_history
+                .push_str(&format!("\nBear: {}", bear_response));
+            debate_state.history.push_str(&format!(
+                "Round {} Bull: {} Bear: {}",
+                round + 1,
+                bull_response,
+                bear_response
+            ));
             debate_state.current_response = bear_response;
             debate_state.count += 1;
         }
@@ -442,12 +462,21 @@ impl GraphEngine {
             let cons_response = cons_result?;
             let neut_response = neut_result?;
 
-            risk_state.aggressive_history.push_str(&format!("\nAggressive: {}", agg_response));
-            risk_state.conservative_history.push_str(&format!("\nConservative: {}", cons_response));
-            risk_state.neutral_history.push_str(&format!("\nNeutral: {}", neut_response));
+            risk_state
+                .aggressive_history
+                .push_str(&format!("\nAggressive: {}", agg_response));
+            risk_state
+                .conservative_history
+                .push_str(&format!("\nConservative: {}", cons_response));
+            risk_state
+                .neutral_history
+                .push_str(&format!("\nNeutral: {}", neut_response));
             risk_state.history.push_str(&format!(
                 "\nRound {}:\nAggressive: {}\nConservative: {}\nNeutral: {}",
-                round + 1, agg_response, cons_response, neut_response
+                round + 1,
+                agg_response,
+                cons_response,
+                neut_response
             ));
             risk_state.current_aggressive_response = agg_response;
             risk_state.current_conservative_response = cons_response;
@@ -576,16 +605,17 @@ impl GraphEngine {
 
         // Build proper message history: each user/assistant turn is a separate message.
         // This allows the LLM to correctly attribute tool results to tool calls.
-        let mut messages = vec![
-            AnthropicMessage {
-                role: "user".to_string(),
-                content: vec![AnthropicContentBlock::Text(prompt.to_string())],
-            }
-        ];
+        let mut messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![AnthropicContentBlock::Text(prompt.to_string())],
+        }];
 
         for round in 0..MAX_ROUNDS {
             // Use complete_messages for proper Anthropic multi-turn format
-            let response = self.llm_quick.complete_messages(messages.clone(), tools).await?;
+            let response = self
+                .llm_quick
+                .complete_messages(messages.clone(), tools)
+                .await?;
 
             let tool_calls = match response.tool_calls {
                 Some(tc) if !tc.is_empty() => tc,
@@ -593,11 +623,23 @@ impl GraphEngine {
             };
 
             // Add assistant message with tool_use blocks (one per tool call)
-            let assistant_blocks: Vec<AnthropicContentBlock> = tool_calls
+            let tool_use_ids: Vec<String> = tool_calls
                 .iter()
                 .enumerate()
-                .map(|(i, tc)| AnthropicContentBlock::ToolUse {
-                    id: format!("tc_{}_{}", round, i),
+                .map(|(i, tc)| {
+                    if tc.id.is_empty() {
+                        format!("tc_{}_{}", round, i)
+                    } else {
+                        tc.id.clone()
+                    }
+                })
+                .collect();
+
+            let assistant_blocks: Vec<AnthropicContentBlock> = tool_calls
+                .iter()
+                .zip(tool_use_ids.iter())
+                .map(|(tc, tool_use_id)| AnthropicContentBlock::ToolUse {
+                    id: tool_use_id.clone(),
                     name: tc.name.clone(),
                     input: tc.arguments.clone(),
                 })
@@ -608,20 +650,20 @@ impl GraphEngine {
             });
 
             // Execute each tool and add tool_result messages (one per tool call)
-            for (i, tc) in tool_calls.iter().enumerate() {
-                let tool_use_id = format!("tc_{}_{}", round, i);
+            for (tc, tool_use_id) in tool_calls.iter().zip(tool_use_ids.iter()) {
                 tracing::info!("Round {}: executing tool {}", round + 1, tc.name);
-                let result_content = match yfinance::execute_tool(&tc.name, &tc.arguments, &self.yfinance).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        tracing::warn!("Tool {} failed: {}", tc.name, e);
-                        format!("error: {}", e)
-                    }
-                };
+                let result_content =
+                    match yfinance::execute_tool(&tc.name, &tc.arguments, &self.yfinance).await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            tracing::warn!("Tool {} failed: {}", tc.name, e);
+                            format!("error: {}", e)
+                        }
+                    };
                 messages.push(AnthropicMessage {
                     role: "user".to_string(),
                     content: vec![AnthropicContentBlock::ToolResult {
-                        tool_use_id,
+                        tool_use_id: tool_use_id.clone(),
                         content: result_content,
                     }],
                 });

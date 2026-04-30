@@ -1,0 +1,8 @@
+TAgent
+Copyright 2026 TAgent contributors
+
+This project is a Rust rebuild inspired by TauricResearch/TradingAgents:
+https://github.com/TauricResearch/TradingAgents
+
+The upstream TradingAgents project is licensed under the Apache License,
+Version 2.0.

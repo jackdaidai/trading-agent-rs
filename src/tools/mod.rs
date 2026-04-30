@@ -7,7 +7,6 @@ use crate::llm::Tool;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-
 /// Type-safe tool names — adding a variant here without handling it in
 /// `execute_tool` will produce a compile error (non-exhaustive match).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,7 +135,8 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let tools = get_all_tools().into_iter()
+        let tools = get_all_tools()
+            .into_iter()
             .map(|t| (t.name.clone(), t))
             .collect();
         Self { tools }
@@ -149,7 +149,8 @@ impl ToolRegistry {
     /// Get a tool by its typed name. Panics only if the registry wasn't populated
     /// with all tools (a programmer error, not user input).
     pub fn get_by_name(&self, name: ToolName) -> Tool {
-        self.tools.get(name.as_str())
+        self.tools
+            .get(name.as_str())
             .cloned()
             .expect("ToolRegistry missing a registered tool — this is a bug")
     }
