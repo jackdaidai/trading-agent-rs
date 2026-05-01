@@ -12,6 +12,28 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+const EVIDENCE_DISCIPLINE: &str = r#"Evidence discipline:
+- Apply these instructions silently; do not quote or refer to this instruction block in the report.
+- Treat tool outputs and analyst reports as the evidence base; do not infer that a contract, catalyst, or metric is absent merely because one tool did not return it.
+- If evidence is missing or thin, say "not observed in current tool output" rather than "absent", "no confirmed", or "does not exist".
+- Preserve named customer contracts, GPU/data-center capacity, financing events, published article dates, and upcoming earnings/catalysts from the news report through the final decision.
+- Prefer raw quantities over derived percentages; only compute ratios when necessary, and check the arithmetic before using them.
+- Separate business/thesis quality from current-entry quality.
+"#;
+
+const DECISION_CALIBRATION: &str = r#"Decision calibration:
+- Apply these rules silently; do not quote, cite, or mention this calibration block in the report. Avoid phrases such as "per decision guidelines", "decision calibration", or "instruction".
+- Separate signed contracts, backlog, and annualized revenue targets from recognized revenue, margins, free cash flow, and balance-sheet capacity.
+- Treat analyst price targets and fair-value estimates as sentiment/reference inputs, not proof of intrinsic value or guaranteed upside.
+- Do not calculate risk/reward only from third-party price targets; anchor downside and upside to observed price levels, catalysts, and fundamentals.
+- Do not assign numeric scenario probabilities unless they come from an explicit quantitative model; use qualitative scenario labels instead.
+- If market cap, revenue, EPS, debt, cash flow, or comparable valuation data are not observed, avoid "high-conviction" language and cap confidence at Medium.
+- A BUY at the current price requires more than a strong business thesis: current entry quality must also be attractive after considering support/resistance, execution risk, financing/dilution, and missing fundamentals.
+- When the business thesis is strong but entry/valuation evidence is incomplete, prefer HOLD, WATCH, or ACCUMULATE ON PULLBACK rather than an unconditional BUY.
+- Do not say a large contract eliminates execution risk; it validates demand but deployment, financing, concentration, and revenue-recognition risks remain.
+- Keep position sizing qualitative and research-oriented unless the user supplied a risk profile; avoid exact portfolio-allocation percentages and personalized sizing by investor profile.
+"#;
+
 // =============================================================================
 // Graph Configuration
 // =============================================================================
@@ -190,7 +212,9 @@ impl GraphEngine {
         let prompt = format!(
             r#"You are a social media sentiment analyst. Analyze sentiment for {ticker} on {date}.
 
-            Use the get_news tool to get recent news and social sentiment around the stock.
+            {evidence_discipline}
+
+            Use the get_news tool with a recent lookback ending on {date} to get recent news and social sentiment around the stock.
 
             Provide a concise sentiment analysis covering:
             - Overall investor sentiment (bullish/bearish/neutral)
@@ -198,7 +222,8 @@ impl GraphEngine {
             - Notable positive or negative catalysts
             - Social media trends if apparent
 
-            End with: FINAL SENTIMENT ANALYSIS: **POSITIVE/NEGATIVE/NEUTRAL**"#
+            End with: FINAL SENTIMENT ANALYSIS: **POSITIVE/NEGATIVE/NEUTRAL**"#,
+            evidence_discipline = EVIDENCE_DISCIPLINE
         );
 
         let tools = vec![self.tool_registry.get_by_name(ToolName::GetNews)];
@@ -210,14 +235,22 @@ impl GraphEngine {
         let prompt = format!(
             r#"You are a news analyst. Analyze news impact for {ticker} on {date}.
 
-            Use the get_news tool to get recent news coverage, and get_global_news for broader market context.
+            {evidence_discipline}
+
+            {decision_calibration}
+
+            Use the get_news tool with a recent lookback ending on {date} to get recent company coverage, and get_global_news for broader market context.
 
             Provide a concise news analysis covering:
             - Key news items affecting the stock
+            - Named contracts, customer wins, GPU/data-center capacity, financing, and upcoming earnings/catalysts if present in the news
+            - A separation between reported company facts and analyst opinions/price targets
             - Impact on near-term outlook
             - Risks or opportunities from recent developments
 
-            End with: FINAL NEWS ANALYSIS: **IMPACT SUMMARY**"#
+            End with: FINAL NEWS ANALYSIS: **IMPACT SUMMARY**"#,
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            decision_calibration = DECISION_CALIBRATION,
         );
 
         let tools = vec![
@@ -232,15 +265,22 @@ impl GraphEngine {
         let prompt = format!(
             r#"You are a fundamentals analyst. Analyze fundamental data for {ticker} on {date}.
 
+            {evidence_discipline}
+
+            {decision_calibration}
+
             Use the get_financials tool (with report_type: overview, balance_sheet, cashflow, income_statement, or insider_transactions) to gather data.
 
             Provide a concise fundamentals analysis covering:
             - Business model and competitive position
             - Key financial metrics (P/E, EPS, revenue growth)
             - Valuation assessment
+            - Whether any valuation view is supported by reported financials or only by external targets/narrative
             - Key risks and strengths
 
-            End with: FINAL FUNDAMENTALS ANALYSIS: **STRONG/WEAK/FAIR**"#
+            End with: FINAL FUNDAMENTALS ANALYSIS: **STRONG/WEAK/FAIR**"#,
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            decision_calibration = DECISION_CALIBRATION,
         );
 
         let tools = vec![self.tool_registry.get_by_name(ToolName::GetFinancials)];
@@ -284,6 +324,10 @@ impl GraphEngine {
                 News: {news}
                 Fundamentals: {fundamentals}
 
+                {evidence_discipline}
+
+                {decision_calibration}
+
                 {memory_context}
                 {prior}
 
@@ -299,6 +343,8 @@ impl GraphEngine {
                 sentiment = state.sentiment_report,
                 news = state.news_report,
                 fundamentals = state.fundamentals_report,
+                evidence_discipline = EVIDENCE_DISCIPLINE,
+                decision_calibration = DECISION_CALIBRATION,
                 prior = if prior_history.is_empty() {
                     String::new()
                 } else {
@@ -315,6 +361,10 @@ impl GraphEngine {
                 News: {news}
                 Fundamentals: {fundamentals}
 
+                {evidence_discipline}
+
+                {decision_calibration}
+
                 {memory_context}
                 {prior}
 
@@ -330,6 +380,8 @@ impl GraphEngine {
                 sentiment = state.sentiment_report,
                 news = state.news_report,
                 fundamentals = state.fundamentals_report,
+                evidence_discipline = EVIDENCE_DISCIPLINE,
+                decision_calibration = DECISION_CALIBRATION,
                 prior = if prior_history.is_empty() {
                     String::new()
                 } else {
@@ -379,6 +431,10 @@ impl GraphEngine {
             News: {news}
             Fundamentals: {fundamentals}
 
+            {evidence_discipline}
+
+            {decision_calibration}
+
             Provide a comprehensive investment plan that:
             - Weighs the bull and bear arguments
             - Provides a clear BUY/HOLD/SELL recommendation
@@ -393,6 +449,8 @@ impl GraphEngine {
             sentiment = state.sentiment_report,
             news = state.news_report,
             fundamentals = state.fundamentals_report,
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            decision_calibration = DECISION_CALIBRATION,
         );
 
         self.llm_deep.complete(&prompt).await
@@ -422,6 +480,10 @@ impl GraphEngine {
             News: {news}
             Fundamentals: {fundamentals}
 
+            {evidence_discipline}
+
+            {decision_calibration}
+
             {memory_context}
 
             Provide a specific trading recommendation:
@@ -438,6 +500,8 @@ impl GraphEngine {
             sentiment = state.sentiment_report,
             news = state.news_report,
             fundamentals = state.fundamentals_report,
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            decision_calibration = DECISION_CALIBRATION,
         );
 
         self.llm_quick.complete(&prompt).await
@@ -501,7 +565,12 @@ impl GraphEngine {
 
             Analyst reports:
             Market: {market}
+            News: {news}
             Fundamentals: {fundamentals}
+
+            {evidence_discipline}
+
+            {decision_calibration}
 
             Provide your aggressive risk assessment:
             - Maximizing upside scenarios
@@ -512,7 +581,10 @@ impl GraphEngine {
             "#,
             trader_plan = state.trader_investment_plan,
             market = state.market_report,
+            news = state.news_report,
             fundamentals = state.fundamentals_report,
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            decision_calibration = DECISION_CALIBRATION,
         );
 
         self.llm_quick.complete(&prompt).await
@@ -526,7 +598,12 @@ impl GraphEngine {
 
             Analyst reports:
             Market: {market}
+            News: {news}
             Fundamentals: {fundamentals}
+
+            {evidence_discipline}
+
+            {decision_calibration}
 
             Provide your conservative risk assessment:
             - Downside protection
@@ -537,7 +614,10 @@ impl GraphEngine {
             "#,
             trader_plan = state.trader_investment_plan,
             market = state.market_report,
+            news = state.news_report,
             fundamentals = state.fundamentals_report,
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            decision_calibration = DECISION_CALIBRATION,
         );
 
         self.llm_quick.complete(&prompt).await
@@ -551,7 +631,12 @@ impl GraphEngine {
 
             Analyst reports:
             Market: {market}
+            News: {news}
             Fundamentals: {fundamentals}
+
+            {evidence_discipline}
+
+            {decision_calibration}
 
             Provide your balanced risk assessment:
             - Weighing upside potential vs downside risk
@@ -562,7 +647,10 @@ impl GraphEngine {
             "#,
             trader_plan = state.trader_investment_plan,
             market = state.market_report,
+            news = state.news_report,
             fundamentals = state.fundamentals_report,
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            decision_calibration = DECISION_CALIBRATION,
         );
 
         self.llm_quick.complete(&prompt).await
@@ -583,18 +671,36 @@ impl GraphEngine {
 
             Investment thesis: {investment_plan}
 
+            Original analyst evidence:
+            Market: {market}
+            Sentiment: {sentiment}
+            News: {news}
+            Fundamentals: {fundamentals}
+
+            {evidence_discipline}
+
+            {decision_calibration}
+
             Provide your final decision with:
             - Rating (BUY/HOLD/SELL/OVERWEIGHT/UNDERWEIGHT)
             - Executive summary
             - Investment thesis
+            - Current price judgment for new money, existing holders, adding, and reducing/selling
+            - Evidence quality and data gaps, especially whether valuation is supported by observed financials or only by external targets
             - Key risks and monitoring points
 
-            End with: FINAL RATING: **{{RATING}}** with 1-sentence justification
+            Avoid personalized allocation guidance. End with: FINAL RATING: **{{RATING}}** with confidence level and 1-sentence justification
             "#,
             company = state.company_of_interest,
             risk_debate = state.risk_debate_state.history,
             trader_plan = state.trader_investment_plan,
             investment_plan = state.investment_plan,
+            market = state.market_report,
+            sentiment = state.sentiment_report,
+            news = state.news_report,
+            fundamentals = state.fundamentals_report,
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            decision_calibration = DECISION_CALIBRATION,
         );
 
         self.llm_deep.complete(&prompt).await

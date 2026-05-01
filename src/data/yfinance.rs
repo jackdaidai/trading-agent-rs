@@ -7,6 +7,12 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const NEWS_ARTICLE_LIMIT: usize = 20;
+const NEWS_EXCERPT_LIMIT: usize = 8;
+const NEWS_EXCERPT_CHARS: usize = 900;
+const YAHOO_USER_AGENT: &str = "Mozilla/5.0";
 
 /// Stock quote data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +70,8 @@ impl YahooFinanceClient {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
-                .user_agent("tagent/0.1.0")
+                .user_agent(YAHOO_USER_AGENT)
+                .timeout(Duration::from_secs(12))
                 .build()
                 .expect("Failed to build Yahoo Finance HTTP client"),
             base_url: std::env::var("TAGENT_YAHOO_BASE_URL")
@@ -75,7 +82,8 @@ impl YahooFinanceClient {
     pub fn with_base_url(base_url: &str) -> Self {
         Self {
             client: reqwest::Client::builder()
-                .user_agent("tagent/0.1.0")
+                .user_agent(YAHOO_USER_AGENT)
+                .timeout(Duration::from_secs(12))
                 .build()
                 .expect("Failed to build Yahoo Finance HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -359,14 +367,13 @@ impl YahooFinanceClient {
 
     /// Get recent news for a ticker
     pub async fn get_news(&self, ticker: &str, start_date: &str, end_date: &str) -> Result<String> {
-        let _ = (start_date, end_date);
         let json = self
             .get_json(
                 "/v1/finance/search",
                 &[
                     ("q", ticker.to_string()),
                     ("quotesCount", "0".to_string()),
-                    ("newsCount", "10".to_string()),
+                    ("newsCount", NEWS_ARTICLE_LIMIT.to_string()),
                 ],
             )
             .await?;
@@ -378,9 +385,18 @@ impl YahooFinanceClient {
             .cloned()
             .unwrap_or_default();
 
-        let mut output = "## Recent News\n\n".to_string();
+        let mut output = format!(
+            "## Recent News\n\nRequested date window: {} to {}. Yahoo search may return relevant articles outside this window; use the published dates below for date fidelity.\n\n",
+            if start_date.is_empty() { "unspecified" } else { start_date },
+            if end_date.is_empty() { "unspecified" } else { end_date }
+        );
 
-        for (i, article) in articles.iter().enumerate().take(10) {
+        if articles.is_empty() {
+            output += "No Yahoo Finance news articles returned for this query.\n";
+            return Ok(output);
+        }
+
+        for (i, article) in articles.iter().enumerate().take(NEWS_ARTICLE_LIMIT) {
             let title = article
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -391,12 +407,57 @@ impl YahooFinanceClient {
                 .and_then(|v| v.as_str())
                 .unwrap_or("N/A");
             let link = article.get("link").and_then(|v| v.as_str()).unwrap_or("#");
+            let published = article
+                .get("providerPublishTime")
+                .and_then(|v| v.as_i64())
+                .map(timestamp_to_date)
+                .unwrap_or_else(|| "N/A".to_string());
+            let summary = article
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
 
             output += &format!("### {}. {}\n", i + 1, title);
-            output += &format!("Source: {} | [Link]({})\n\n", source, link);
+            output += &format!("Source: {} | Published: {} | [Link]({})\n", source, published, link);
+            if let Some(summary) = summary {
+                output += &format!("Summary: {}\n", summary);
+            }
+            if i < NEWS_EXCERPT_LIMIT {
+                if let Some(excerpt) = self.fetch_article_excerpt(link, ticker).await {
+                    output += &format!("Article excerpt: {}\n", excerpt);
+                }
+            }
+            output += "\n";
         }
 
         Ok(output)
+    }
+
+    async fn fetch_article_excerpt(&self, link: &str, ticker: &str) -> Option<String> {
+        if !link.starts_with("http://") && !link.starts_with("https://") {
+            return None;
+        }
+
+        let response = self.client.get(link).send().await.ok()?.error_for_status().ok()?;
+        let html = response.text().await.ok()?;
+        let text = html_to_text(&html);
+        let terms = [
+            ticker,
+            "contract",
+            "customer",
+            "Microsoft",
+            "GPU",
+            "AI",
+            "cloud",
+            "data center",
+            "revenue",
+            "ARR",
+            "financing",
+            "capex",
+            "earnings",
+        ];
+        excerpt_around_terms(&text, &terms, NEWS_EXCERPT_CHARS)
     }
 
     // Keep utility methods for tests
@@ -486,6 +547,196 @@ fn encode_component(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn html_to_text(html: &str) -> String {
+    let article_text = extract_paragraph_text(html);
+    if !article_text.is_empty() {
+        return article_text;
+    }
+
+    let without_scripts = remove_html_block(remove_html_block(html, "script"), "style");
+    strip_html_tags(&without_scripts)
+}
+
+fn extract_paragraph_text(html: &str) -> String {
+    let mut paragraphs = Vec::new();
+    let mut remaining = html;
+
+    loop {
+        let Some(open_index) = find_paragraph_open(remaining) else {
+            break;
+        };
+        let after_open = &remaining[open_index..];
+        let Some(tag_end) = after_open.find('>') else {
+            break;
+        };
+        let after_tag = &after_open[tag_end + 1..];
+        let lower_after_tag = after_tag.to_lowercase();
+        let Some(close_index) = lower_after_tag.find("</p>") else {
+            break;
+        };
+
+        let paragraph = strip_html_tags(&after_tag[..close_index]);
+        if is_useful_article_paragraph(&paragraph) {
+            paragraphs.push(paragraph);
+        }
+
+        remaining = &after_tag[close_index + "</p>".len()..];
+    }
+
+    collapse_whitespace(&paragraphs.join(" "))
+}
+
+fn find_paragraph_open(input: &str) -> Option<usize> {
+    let lower = input.to_lowercase();
+    let mut offset = 0;
+
+    while let Some(relative_index) = lower[offset..].find("<p") {
+        let index = offset + relative_index;
+        let next = lower[index + 2..].chars().next();
+        if matches!(next, Some('>' | ' ' | '\t' | '\n' | '\r')) {
+            return Some(index);
+        }
+        offset = index + 2;
+    }
+
+    None
+}
+
+fn is_useful_article_paragraph(paragraph: &str) -> bool {
+    if paragraph.chars().count() < 40 {
+        return false;
+    }
+
+    let lower = paragraph.to_lowercase();
+    let boilerplate_prefixes = [
+        "advertisement",
+        "read the full narrative",
+        "explore ",
+        "find ",
+        "opportunities like",
+        "this article by",
+        "our free ",
+        "disagree with existing narratives",
+    ];
+
+    !boilerplate_prefixes
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+fn strip_html_tags(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+
+    collapse_whitespace(&decode_html_entities(&text))
+}
+
+fn remove_html_block(input: impl AsRef<str>, tag: &str) -> String {
+    let input = input.as_ref();
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    let open = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+
+    loop {
+        let lower = remaining.to_lowercase();
+        let Some(start) = lower.find(&open) else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start..];
+        let lower_after = after_start.to_lowercase();
+        if let Some(end) = lower_after.find(&close) {
+            remaining = &after_start[end + close.len()..];
+        } else {
+            break;
+        }
+    }
+
+    output
+}
+
+fn decode_html_entities(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut last_was_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                output.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            output.push(ch);
+            last_was_space = false;
+        }
+    }
+    output.trim().to_string()
+}
+
+fn excerpt_around_terms(text: &str, terms: &[&str], max_chars: usize) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+
+    let lower = text.to_lowercase();
+    let mut best_index = None;
+    for term in terms {
+        let term = term.trim().to_lowercase();
+        if term.is_empty() {
+            continue;
+        }
+        if let Some(index) = lower.find(&term) {
+            best_index = Some(best_index.map_or(index, |current: usize| current.min(index)));
+        }
+    }
+
+    let start = best_index
+        .map(|index| index.saturating_sub(max_chars / 3))
+        .unwrap_or(0);
+    let mut end = (start + max_chars).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut start = start;
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+
+    let mut excerpt = text[start..end].trim().to_string();
+    if start > 0 {
+        excerpt = format!("...{}", excerpt);
+    }
+    if end < text.len() {
+        excerpt.push_str("...");
+    }
+    Some(excerpt)
 }
 
 /// Tool execution router - routes tool calls to appropriate data sources
@@ -596,6 +847,27 @@ mod tests {
     }
 
     #[test]
+    fn test_html_to_text_prefers_article_paragraphs() {
+        let html = r#"
+            <html>
+                <title>IREN Microsoft AI Deal</title>
+                <nav>Skip to navigation News Weather Shopping</nav>
+                <script>var noise = "Microsoft";</script>
+                <svg><path d="M11 15h2v2h-2"></path></svg>
+                <progress max="100" value="0"></progress>
+                <p>In recent weeks, IREN secured a five-year, US$9.70 billion agreement with Microsoft for AI infrastructure capacity.</p>
+                <p>The March 2026 plan includes over 50,000 NVIDIA B300 GPUs, taking the fleet to 150,000 units.</p>
+            </html>
+        "#;
+
+        let text = html_to_text(html);
+        assert!(text.starts_with("In recent weeks"));
+        assert!(text.contains("US$9.70 billion agreement with Microsoft"));
+        assert!(text.contains("50,000 NVIDIA B300 GPUs"));
+        assert!(!text.contains("Skip to navigation"));
+    }
+
+    #[test]
     fn test_required_tool_arg_rejects_missing_values() {
         let args = serde_json::json!({"symbol": ""});
         let err = required_tool_arg(&args, "symbol").unwrap_err().to_string();
@@ -626,5 +898,19 @@ mod tests {
             .await
             .unwrap();
         assert!(news.contains("Recent News"));
+    }
+
+    #[tokio::test]
+    #[ignore = "hits live Yahoo Finance endpoints"]
+    async fn test_live_iren_news_extracts_article_evidence() {
+        let client = YahooFinanceClient::new();
+        let news = client
+            .get_news("IREN", "2026-04-01", "2026-05-01")
+            .await
+            .unwrap();
+
+        assert!(news.contains("Microsoft"));
+        assert!(news.contains("US$9.70") || news.contains("9.70"));
+        assert!(news.contains("B300") || news.contains("50,000"));
     }
 }
