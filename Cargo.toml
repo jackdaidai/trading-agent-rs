@@ -1,6 +1,6 @@
 [package]
 name = "tagent"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
@@ -34,6 +34,9 @@ regex = "1"
 
 # Anyhow for error handling
 anyhow = "1"
+
+# Command-line interface
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 lto = true
