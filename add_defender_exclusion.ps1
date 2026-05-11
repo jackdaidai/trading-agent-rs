@@ -1,3 +1,3 @@
 $ErrorActionPreference = "Stop"
-Add-MpPreference -ExclusionPath "C:\Users\jiehu\dev\tagent\target" -ErrorAction Stop
+Add-MpPreference -ExclusionPath (Join-Path $PSScriptRoot "target") -ErrorAction Stop
 Write-Host "Exclusion added"

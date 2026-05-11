@@ -1,6 +1,6 @@
-# Contributing to TAgent
+# Contributing to trading-agent-rs
 
-Thanks for helping improve TAgent. This project combines Rust orchestration, native Yahoo Finance data fetching, and LLM provider integrations, so contributions should keep reliability, safety, and reproducibility in mind.
+Thanks for helping improve trading-agent-rs. This project combines Rust orchestration, native Yahoo Finance data fetching, and LLM provider integrations, so contributions should keep reliability, safety, and reproducibility in mind.
 
 ## Development setup
 
@@ -11,7 +11,7 @@ cargo test
 
 Fill in `.env` only when you need to run live provider-backed analysis. Do not commit real API keys, generated reports, benchmark output, or local binaries.
 
-`Cargo.lock` is intentionally committed because TAgent is a binary application and release builds should be reproducible.
+`Cargo.lock` is intentionally committed because trading-agent-rs is a binary application and release builds should be reproducible.
 
 ## Before opening a pull request
 
@@ -55,4 +55,4 @@ When filing an issue, include:
 - Provider name and model, without API keys
 - Command run
 - Relevant error output
-- Whether the issue reproduces with `TAGENT_BATCH_CONCURRENCY=1`
+- Whether the issue reproduces with `TRADING_AGENT_BATCH_CONCURRENCY=1`

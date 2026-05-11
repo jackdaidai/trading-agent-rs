@@ -59,6 +59,14 @@ impl Provider {
     }
 }
 
+fn env_var(primary: &str, legacy: &str) -> std::result::Result<String, std::env::VarError> {
+    match std::env::var(primary) {
+        Ok(value) => Ok(value),
+        Err(std::env::VarError::NotPresent) => std::env::var(legacy),
+        Err(err) => Err(err),
+    }
+}
+
 impl FromStr for Provider {
     type Err = anyhow::Error;
 
@@ -69,7 +77,7 @@ impl FromStr for Provider {
             "openai" => Ok(Self::OpenAI),
             "anthropic" => Ok(Self::Anthropic),
             other => bail!(
-                "Unsupported TAGENT_PROVIDER '{}'. Expected minimax, zai, openai, or anthropic.",
+                "Unsupported TRADING_AGENT_PROVIDER '{}'. Expected minimax, zai, openai, or anthropic.",
                 other
             ),
         }
@@ -94,7 +102,7 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
-        let provider = std::env::var("TAGENT_PROVIDER")
+        let provider = env_var("TRADING_AGENT_PROVIDER", "TAGENT_PROVIDER")
             .unwrap_or_else(|_| Provider::MiniMax.as_str().to_string())
             .parse::<Provider>()?;
 
@@ -103,36 +111,40 @@ impl AppConfig {
             .unwrap_or_else(|_| provider.default_base_url().to_string());
         let provider_model = provider.default_model().to_string();
 
-        let api_key = std::env::var("TAGENT_API_KEY").unwrap_or(provider_api_key);
-        let base_url = std::env::var("TAGENT_BASE_URL").unwrap_or(provider_base_url);
-        let default_model = std::env::var("TAGENT_MODEL").unwrap_or(provider_model);
-        let quick_model =
-            std::env::var("TAGENT_QUICK_MODEL").unwrap_or_else(|_| default_model.clone());
-        let deep_model = std::env::var("TAGENT_DEEP_MODEL").unwrap_or(default_model);
-        let reports_dir = std::env::var("TAGENT_REPORTS_DIR")
+        let api_key =
+            env_var("TRADING_AGENT_API_KEY", "TAGENT_API_KEY").unwrap_or(provider_api_key);
+        let base_url =
+            env_var("TRADING_AGENT_BASE_URL", "TAGENT_BASE_URL").unwrap_or(provider_base_url);
+        let default_model =
+            env_var("TRADING_AGENT_MODEL", "TAGENT_MODEL").unwrap_or(provider_model);
+        let quick_model = env_var("TRADING_AGENT_QUICK_MODEL", "TAGENT_QUICK_MODEL")
+            .unwrap_or_else(|_| default_model.clone());
+        let deep_model =
+            env_var("TRADING_AGENT_DEEP_MODEL", "TAGENT_DEEP_MODEL").unwrap_or(default_model);
+        let reports_dir = env_var("TRADING_AGENT_REPORTS_DIR", "TAGENT_REPORTS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("reports"));
         let batch_concurrency = batch_concurrency_from_env()?;
 
         if api_key.trim().is_empty() {
             bail!(
-                "Missing API key for provider '{}'. Set TAGENT_API_KEY or {}.",
+                "Missing API key for provider '{}'. Set TRADING_AGENT_API_KEY, TAGENT_API_KEY, or {}.",
                 provider.as_str(),
                 provider.api_key_env()
             );
         }
         if base_url.trim().is_empty() {
             bail!(
-                "Missing base URL for provider '{}'. Set TAGENT_BASE_URL or {}.",
+                "Missing base URL for provider '{}'. Set TRADING_AGENT_BASE_URL, TAGENT_BASE_URL, or {}.",
                 provider.as_str(),
                 provider.base_url_env()
             );
         }
         if quick_model.trim().is_empty() || deep_model.trim().is_empty() {
-            bail!("Missing LLM model name. Set TAGENT_MODEL or both TAGENT_QUICK_MODEL and TAGENT_DEEP_MODEL.");
+            bail!("Missing LLM model name. Set TRADING_AGENT_MODEL or both TRADING_AGENT_QUICK_MODEL and TRADING_AGENT_DEEP_MODEL.");
         }
         if reports_dir.as_os_str().is_empty() {
-            bail!("TAGENT_REPORTS_DIR must not be empty.");
+            bail!("TRADING_AGENT_REPORTS_DIR must not be empty.");
         }
 
         Ok(Self {
@@ -150,18 +162,21 @@ impl AppConfig {
 }
 
 fn batch_concurrency_from_env() -> Result<usize> {
-    match std::env::var("TAGENT_BATCH_CONCURRENCY") {
+    match env_var(
+        "TRADING_AGENT_BATCH_CONCURRENCY",
+        "TAGENT_BATCH_CONCURRENCY",
+    ) {
         Ok(value) => {
             let parsed = value
                 .parse::<usize>()
-                .with_context(|| format!("Invalid TAGENT_BATCH_CONCURRENCY '{}'", value))?;
+                .with_context(|| format!("Invalid TRADING_AGENT_BATCH_CONCURRENCY '{}'", value))?;
             if parsed == 0 {
-                bail!("TAGENT_BATCH_CONCURRENCY must be at least 1");
+                bail!("TRADING_AGENT_BATCH_CONCURRENCY must be at least 1");
             }
             Ok(parsed)
         }
         Err(std::env::VarError::NotPresent) => Ok(1),
-        Err(e) => Err(e).context("Invalid TAGENT_BATCH_CONCURRENCY"),
+        Err(e) => Err(e).context("Invalid TRADING_AGENT_BATCH_CONCURRENCY"),
     }
 }
 
@@ -183,6 +198,6 @@ mod tests {
     #[test]
     fn provider_from_str_rejects_unknown_values() {
         let err = "ollama".parse::<Provider>().unwrap_err().to_string();
-        assert!(err.contains("Unsupported TAGENT_PROVIDER"));
+        assert!(err.contains("Unsupported TRADING_AGENT_PROVIDER"));
     }
 }

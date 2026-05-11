@@ -25,4 +25,4 @@ Relevant security issues include:
 
 ## Financial safety
 
-TAgent is for research and education only. It must not be presented as a source of personalized financial, investment, tax, or legal advice.
+trading-agent-rs is for research and education only. It must not be presented as a source of personalized financial, investment, tax, or legal advice.

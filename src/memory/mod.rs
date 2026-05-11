@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_roundtrip() {
-        let dir = std::env::temp_dir().join("tagent_test_memory");
+        let dir = std::env::temp_dir().join("trading_agent_rs_test_memory");
         let path = dir.join("test_roundtrip.json");
 
         // Save

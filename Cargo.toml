@@ -1,6 +1,6 @@
 [package]
-name = "tagent"
-version = "0.3.6"
+name = "trading-agent-rs"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"

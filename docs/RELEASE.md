@@ -57,14 +57,14 @@ Do not include:
 On Windows, `cargo build --release` produces:
 
 ```powershell
-target\release\tagent.exe
+target\release\trading-agent-rs.exe
 ```
 
 For users who do not want to install Rust, publish a zip file in GitHub Releases, for example:
 
 ```text
-tagent-vX.Y.Z-windows-x86_64.zip
-├── tagent.exe
+trading-agent-rs-vX.Y.Z-windows-x86_64.zip
+├── trading-agent-rs.exe
 ├── .env.example
 ├── README.md
 ├── LICENSE

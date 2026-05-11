@@ -2,7 +2,7 @@
 //! Native Yahoo Finance data fetching.
 //!
 //! This module uses Yahoo Finance's public chart and search endpoints directly
-//! through reqwest, so the TAgent binary no longer depends on a Python proxy.
+//! through reqwest, so the trading-agent-rs binary no longer depends on a Python proxy.
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -74,7 +74,8 @@ impl YahooFinanceClient {
                 .timeout(Duration::from_secs(12))
                 .build()
                 .expect("Failed to build Yahoo Finance HTTP client"),
-            base_url: std::env::var("TAGENT_YAHOO_BASE_URL")
+            base_url: std::env::var("TRADING_AGENT_YAHOO_BASE_URL")
+                .or_else(|_| std::env::var("TAGENT_YAHOO_BASE_URL"))
                 .unwrap_or_else(|_| "https://query1.finance.yahoo.com".to_string()),
         }
     }
@@ -419,7 +420,10 @@ impl YahooFinanceClient {
                 .filter(|value| !value.is_empty());
 
             output += &format!("### {}. {}\n", i + 1, title);
-            output += &format!("Source: {} | Published: {} | [Link]({})\n", source, published, link);
+            output += &format!(
+                "Source: {} | Published: {} | [Link]({})\n",
+                source, published, link
+            );
             if let Some(summary) = summary {
                 output += &format!("Summary: {}\n", summary);
             }
@@ -439,7 +443,14 @@ impl YahooFinanceClient {
             return None;
         }
 
-        let response = self.client.get(link).send().await.ok()?.error_for_status().ok()?;
+        let response = self
+            .client
+            .get(link)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
         let html = response.text().await.ok()?;
         let text = html_to_text(&html);
         let terms = [
@@ -563,10 +574,7 @@ fn extract_paragraph_text(html: &str) -> String {
     let mut paragraphs = Vec::new();
     let mut remaining = html;
 
-    loop {
-        let Some(open_index) = find_paragraph_open(remaining) else {
-            break;
-        };
+    while let Some(open_index) = find_paragraph_open(remaining) {
         let after_open = &remaining[open_index..];
         let Some(tag_end) = after_open.find('>') else {
             break;

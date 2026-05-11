@@ -1,6 +1,6 @@
-# TAgent architecture
+# trading-agent-rs architecture
 
-TAgent is a Rust CLI that turns a ticker and trade date into a Markdown trading-analysis report. The runtime is split into four layers:
+trading-agent-rs is a Rust CLI that turns a ticker and trade date into a Markdown trading-analysis report. The runtime is split into four layers:
 
 1. `src\main.rs` parses CLI arguments, loads `AppConfig`, validates tickers, controls batch concurrency, and writes reports.
 2. `src\graph\engine.rs` runs the analysis graph. It calls analysts, debate phases, trader synthesis, risk review, and portfolio-manager synthesis in order.
@@ -18,11 +18,11 @@ TAgent is a Rust CLI that turns a ticker and trade date into a Markdown trading-
 - risky, safe, and neutral analysts write risk debate history
 - the portfolio manager writes the final trade decision
 
-The final decision is printed and saved by `print_and_save` under `TAGENT_REPORTS_DIR` or `reports` by default.
+The final decision is printed and saved by `print_and_save` under `TRADING_AGENT_REPORTS_DIR` or `reports` by default. Legacy `TAGENT_REPORTS_DIR` is still accepted.
 
 ## Tool calls
 
-`GraphEngine::execute_llm_with_tools` sends a prompt plus available tool schemas to the quick LLM. If the model requests tools, TAgent executes each request through `yfinance::execute_tool`, appends tool results to the message history, and asks again. The loop is capped to avoid unbounded provider calls.
+`GraphEngine::execute_llm_with_tools` sends a prompt plus available tool schemas to the quick LLM. If the model requests tools, trading-agent-rs executes each request through `yfinance::execute_tool`, appends tool results to the message history, and asks again. The loop is capped to avoid unbounded provider calls.
 
 LLM response parsing should fail loudly when required tool-call fields are missing or malformed. Silent empty defaults make provider failures look like valid empty research.
 

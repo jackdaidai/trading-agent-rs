@@ -23,7 +23,7 @@ Copy `.env.example` to `.env` only when running live analysis:
 Copy-Item .env.example .env
 ```
 
-The default provider is MiniMax. Generic `TAGENT_*` variables override provider-specific variables. Use `TAGENT_REPORTS_DIR` to keep generated reports outside the repo root during testing.
+The default provider is MiniMax. Generic `TRADING_AGENT_*` variables override provider-specific variables. Use `TRADING_AGENT_REPORTS_DIR` to keep generated reports outside the repo root during testing. Legacy `TAGENT_*` variables are still accepted for compatibility.
 
 ## Testing provider behavior
 

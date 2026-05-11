@@ -1,5 +1,5 @@
-TAgent
-Copyright 2026 TAgent contributors
+trading-agent-rs
+Copyright 2026 trading-agent-rs contributors
 
 This project is a Rust rebuild inspired by TauricResearch/TradingAgents:
 https://github.com/TauricResearch/TradingAgents

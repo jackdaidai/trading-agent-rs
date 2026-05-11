@@ -1,4 +1,4 @@
-# CEO Review Summary - TAgent v0.2.0
+# CEO Review Summary - trading-agent-rs v0.2.0
 
 **Date:** 2026-04-26
 **Mode:** Selective Expansion (Approach #2: Structural Improvement)

@@ -3,21 +3,21 @@ use clap::{Args, Parser, Subcommand};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tagent::config::AppConfig;
-use tagent::graph::engine::{GraphConfig, GraphEngine};
-use tagent::graph::state::AgentState;
-use tagent::llm::{AnyLLMClient, LLMClient};
 use tokio::sync::Semaphore;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use trading_agent_rs::config::AppConfig;
+use trading_agent_rs::graph::engine::{GraphConfig, GraphEngine};
+use trading_agent_rs::graph::state::AgentState;
+use trading_agent_rs::llm::{AnyLLMClient, LLMClient};
 
 const FINANCIAL_DISCLAIMER: &str = "For research and education only. Not financial advice, investment advice, or a recommendation to buy, sell, or hold any security.";
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "tagent",
+    name = "trading-agent-rs",
     version,
-    about = "Rust multi-agent trading-analysis reports",
-    long_about = "TAgent runs a TradingAgents-style analyst, debate, trader, risk, and portfolio-manager pipeline from native Rust."
+    about = "Rust-native AI stock analysis agent",
+    long_about = "trading-agent-rs runs a TradingAgents-style analyst, debate, trader, risk, and portfolio-manager pipeline from native Rust."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,27 +48,27 @@ enum ConfigCommand {
 
 #[derive(Debug, Args, Clone, Default)]
 struct ConfigOverrides {
-    /// Override TAGENT_PROVIDER for this run.
+    /// Override TRADING_AGENT_PROVIDER for this run.
     #[arg(long, value_name = "PROVIDER")]
     provider: Option<String>,
 
-    /// Override TAGENT_MODEL for both quick and deep calls.
+    /// Override TRADING_AGENT_MODEL for both quick and deep calls.
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
 
-    /// Override TAGENT_QUICK_MODEL for analyst/tool-heavy calls.
+    /// Override TRADING_AGENT_QUICK_MODEL for analyst/tool-heavy calls.
     #[arg(long, value_name = "MODEL")]
     quick_model: Option<String>,
 
-    /// Override TAGENT_DEEP_MODEL for synthesis calls.
+    /// Override TRADING_AGENT_DEEP_MODEL for synthesis calls.
     #[arg(long, value_name = "MODEL")]
     deep_model: Option<String>,
 
-    /// Override TAGENT_BATCH_CONCURRENCY for batch runs.
+    /// Override TRADING_AGENT_BATCH_CONCURRENCY for batch runs.
     #[arg(long, value_name = "N")]
     concurrency: Option<usize>,
 
-    /// Override TAGENT_REPORTS_DIR for generated Markdown reports.
+    /// Override TRADING_AGENT_REPORTS_DIR for generated Markdown reports.
     #[arg(long, value_name = "DIR")]
     reports_dir: Option<PathBuf>,
 }
@@ -105,7 +105,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("tagent=info".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("trading_agent_rs=info".parse()?),
         )
         .init();
 
@@ -132,7 +133,7 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
     let app_config = AppConfig::from_env()?;
 
     tracing::info!(
-        "Initializing TAgent with provider={}, quick={}, deep={}",
+        "Initializing trading-agent-rs with provider={}, quick={}, deep={}",
         app_config.llm.provider.as_str(),
         app_config.llm.quick_model,
         app_config.llm.deep_model
@@ -185,7 +186,7 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
 
     // Validate all tickers in parallel
     {
-        use tagent::data::yfinance::YahooFinanceClient;
+        use trading_agent_rs::data::yfinance::YahooFinanceClient;
         let yf = YahooFinanceClient::new();
         let mut validates = Vec::new();
         for t in &tickers {
@@ -296,27 +297,31 @@ fn print_providers() {
     println!("  openai     API key: OPENAI_API_KEY      Base URL: OPENAI_BASE_URL");
     println!("  anthropic  API key: ANTHROPIC_API_KEY   Base URL: ANTHROPIC_BASE_URL");
     println!();
-    println!("Generic overrides: TAGENT_API_KEY, TAGENT_BASE_URL, TAGENT_MODEL, TAGENT_QUICK_MODEL, TAGENT_DEEP_MODEL");
+    println!("Generic overrides: TRADING_AGENT_API_KEY, TRADING_AGENT_BASE_URL, TRADING_AGENT_MODEL, TRADING_AGENT_QUICK_MODEL, TRADING_AGENT_DEEP_MODEL");
+    println!("Legacy TAGENT_* variables are still accepted for compatibility.");
 }
 
 fn apply_config_overrides(overrides: &ConfigOverrides) -> Result<()> {
-    set_env_if_present("TAGENT_PROVIDER", overrides.provider.as_deref());
-    set_env_if_present("TAGENT_MODEL", overrides.model.as_deref());
-    set_env_if_present("TAGENT_QUICK_MODEL", overrides.quick_model.as_deref());
-    set_env_if_present("TAGENT_DEEP_MODEL", overrides.deep_model.as_deref());
+    set_env_if_present("TRADING_AGENT_PROVIDER", overrides.provider.as_deref());
+    set_env_if_present("TRADING_AGENT_MODEL", overrides.model.as_deref());
+    set_env_if_present(
+        "TRADING_AGENT_QUICK_MODEL",
+        overrides.quick_model.as_deref(),
+    );
+    set_env_if_present("TRADING_AGENT_DEEP_MODEL", overrides.deep_model.as_deref());
 
     if let Some(concurrency) = overrides.concurrency {
         if concurrency == 0 {
             anyhow::bail!("--concurrency must be at least 1");
         }
-        std::env::set_var("TAGENT_BATCH_CONCURRENCY", concurrency.to_string());
+        std::env::set_var("TRADING_AGENT_BATCH_CONCURRENCY", concurrency.to_string());
     }
 
     if let Some(reports_dir) = &overrides.reports_dir {
         if reports_dir.as_os_str().is_empty() {
             anyhow::bail!("--reports-dir must not be empty");
         }
-        std::env::set_var("TAGENT_REPORTS_DIR", reports_dir);
+        std::env::set_var("TRADING_AGENT_REPORTS_DIR", reports_dir);
     }
 
     Ok(())
@@ -464,7 +469,7 @@ mod tests {
 
     #[test]
     fn clap_accepts_legacy_top_level_ticker_args() {
-        let cli = Cli::try_parse_from(["tagent", "AAPL", "MSFT", "2026-04-30"]).unwrap();
+        let cli = Cli::try_parse_from(["trading-agent-rs", "AAPL", "MSFT", "2026-04-30"]).unwrap();
 
         assert!(cli.command.is_none());
         assert_eq!(
@@ -480,7 +485,7 @@ mod tests {
     #[test]
     fn clap_accepts_analyze_subcommand_args() {
         let cli = Cli::try_parse_from([
-            "tagent",
+            "trading-agent-rs",
             "analyze",
             "AAPL",
             "--date",
