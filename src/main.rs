@@ -184,6 +184,11 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
 
     tracing::info!("Tickers: {:?}, Date: {}", tickers, trade_date);
 
+    // Security: reject tickers with path-traversal or injection characters
+    for t in &tickers {
+        trading_agent_rs::data::yfinance::validate_ticker(t)?;
+    }
+
     // Validate all tickers in parallel
     {
         use trading_agent_rs::data::yfinance::YahooFinanceClient;

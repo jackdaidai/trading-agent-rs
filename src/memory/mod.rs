@@ -1,9 +1,13 @@
-//! BM25 memory system for tracking past trading situations and lessons
+//! Memory system for tracking past trading situations and lessons.
+//!
+//! Provides two complementary subsystems:
+//! - `BM25Memory`: fast in-session retrieval by query similarity (per-agent)
+//! - `DecisionLog`: persistent on-disk log of trading decisions with resolution tracking
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9]+\b").unwrap());
@@ -219,6 +223,282 @@ pub struct MemoryMatch {
     pub similarity_score: f64,
 }
 
+// =============================================================================
+// Persistent Decision Log
+// =============================================================================
+
+/// Status of a decision entry
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionStatus {
+    Pending,
+    Resolved,
+}
+
+/// A single decision log entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionEntry {
+    pub ticker: String,
+    pub date: String,
+    pub rating: String,
+    pub confidence: String,
+    pub summary: String,
+    pub status: DecisionStatus,
+    /// Filled on resolution: realized return since decision
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realized_return: Option<f64>,
+    /// Filled on resolution: alpha vs benchmark
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
+    /// Filled on resolution: one-paragraph reflection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<String>,
+    /// ISO timestamp when the entry was created
+    pub created_at: String,
+    /// ISO timestamp when the entry was resolved (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+}
+
+/// On-disk format for the decision log
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DecisionLogStore {
+    entries: Vec<DecisionEntry>,
+}
+
+/// Persistent decision log that survives across runs.
+///
+/// Decisions are appended after each analysis. On subsequent runs for the same
+/// ticker, pending entries are surfaced as context for the portfolio manager.
+pub struct DecisionLog {
+    path: PathBuf,
+    entries: Vec<DecisionEntry>,
+    max_resolved_entries: Option<usize>,
+}
+
+impl DecisionLog {
+    /// Default path: `~/.trading-agent-rs/decisions/decisions.json`
+    pub fn default_path() -> PathBuf {
+        std::env::var("TRADING_AGENT_MEMORY_LOG_PATH")
+            .or_else(|_| std::env::var("TAGENT_MEMORY_LOG_PATH"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".trading-agent-rs")
+                    .join("decisions")
+                    .join("decisions.json")
+            })
+    }
+
+    /// Load from the given path, or create empty if not found.
+    pub fn load(path: &Path, max_resolved_entries: Option<usize>) -> Self {
+        let entries = if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(data) => serde_json::from_str::<DecisionLogStore>(&data)
+                    .map(|s| s.entries)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("Failed to parse decision log: {}", e);
+                        Vec::new()
+                    }),
+                Err(e) => {
+                    tracing::warn!("Failed to read decision log: {}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            path: path.to_path_buf(),
+            entries,
+            max_resolved_entries,
+        }
+    }
+
+    /// Persist the log to disk.
+    pub fn save(&self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store = DecisionLogStore {
+            entries: self.entries.clone(),
+        };
+        let json = serde_json::to_string_pretty(&store)?;
+        std::fs::write(&self.path, json)?;
+        tracing::debug!("Decision log saved to {}", self.path.display());
+        Ok(())
+    }
+
+    /// Append a new pending decision after a completed analysis.
+    pub fn log_decision(
+        &mut self,
+        ticker: &str,
+        date: &str,
+        rating: &str,
+        confidence: &str,
+        summary: &str,
+    ) {
+        let entry = DecisionEntry {
+            ticker: ticker.to_string(),
+            date: date.to_string(),
+            rating: rating.to_string(),
+            confidence: confidence.to_string(),
+            summary: summary.to_string(),
+            status: DecisionStatus::Pending,
+            realized_return: None,
+            alpha: None,
+            reflection: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            resolved_at: None,
+        };
+        self.entries.push(entry);
+        self.prune_resolved();
+    }
+
+    /// Resolve a pending entry with outcome data.
+    #[allow(dead_code)]
+    pub fn resolve(
+        &mut self,
+        ticker: &str,
+        date: &str,
+        realized_return: f64,
+        alpha: f64,
+        reflection: &str,
+    ) {
+        for entry in self.entries.iter_mut() {
+            if entry.ticker == ticker
+                && entry.date == date
+                && entry.status == DecisionStatus::Pending
+            {
+                entry.status = DecisionStatus::Resolved;
+                entry.realized_return = Some(realized_return);
+                entry.alpha = Some(alpha);
+                entry.reflection = Some(reflection.to_string());
+                entry.resolved_at = Some(chrono::Utc::now().to_rfc3339());
+                break;
+            }
+        }
+        self.prune_resolved();
+    }
+
+    /// Get all pending decisions for a ticker (for context injection).
+    pub fn pending_for_ticker(&self, ticker: &str) -> Vec<&DecisionEntry> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.ticker.eq_ignore_ascii_case(ticker) && e.status == DecisionStatus::Pending
+            })
+            .collect()
+    }
+
+    /// Get recent resolved decisions for a ticker (lessons learned).
+    pub fn resolved_for_ticker(&self, ticker: &str, limit: usize) -> Vec<&DecisionEntry> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.ticker.eq_ignore_ascii_case(ticker) && e.status == DecisionStatus::Resolved
+            })
+            .rev()
+            .take(limit)
+            .collect()
+    }
+
+    /// Format decision history as context for prompts.
+    pub fn format_context(&self, ticker: &str) -> String {
+        let pending = self.pending_for_ticker(ticker);
+        let resolved = self.resolved_for_ticker(ticker, 5);
+
+        if pending.is_empty() && resolved.is_empty() {
+            return String::new();
+        }
+
+        let mut ctx = String::from("## Prior Decision History\n\n");
+
+        if !resolved.is_empty() {
+            ctx.push_str("### Resolved (with outcomes)\n");
+            for e in &resolved {
+                ctx.push_str(&format!(
+                    "- [{date}] {rating} (confidence: {conf}) → Return: {ret:.1}%, Alpha: {alpha:.1}%\n  Reflection: {refl}\n",
+                    date = e.date,
+                    rating = e.rating,
+                    conf = e.confidence,
+                    ret = e.realized_return.unwrap_or(0.0),
+                    alpha = e.alpha.unwrap_or(0.0),
+                    refl = e.reflection.as_deref().unwrap_or("N/A"),
+                ));
+            }
+            ctx.push('\n');
+        }
+
+        if !pending.is_empty() {
+            ctx.push_str("### Pending (awaiting resolution)\n");
+            for e in &pending {
+                ctx.push_str(&format!(
+                    "- [{date}] {rating} (confidence: {conf}): {summary}\n",
+                    date = e.date,
+                    rating = e.rating,
+                    conf = e.confidence,
+                    summary = truncate_str(&e.summary, 200),
+                ));
+            }
+            ctx.push('\n');
+        }
+
+        ctx
+    }
+
+    /// Total entry count
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Prune oldest resolved entries if over the cap.
+    fn prune_resolved(&mut self) {
+        if let Some(max) = self.max_resolved_entries {
+            let resolved_count = self
+                .entries
+                .iter()
+                .filter(|e| e.status == DecisionStatus::Resolved)
+                .count();
+            if resolved_count > max {
+                let to_remove = resolved_count - max;
+                let mut removed = 0;
+                self.entries.retain(|e| {
+                    if removed >= to_remove {
+                        return true;
+                    }
+                    if e.status == DecisionStatus::Resolved {
+                        removed += 1;
+                        return false;
+                    }
+                    true
+                });
+            }
+        }
+    }
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    if s.len() <= max_chars {
+        s
+    } else {
+        let end = s
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        &s[..end]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +599,94 @@ mod tests {
     fn test_from_file_missing_file() {
         let mem = BM25Memory::from_file("test", Path::new("/nonexistent/path.json"));
         assert!(mem.is_empty());
+    }
+
+    // =========================================================================
+    // DecisionLog tests
+    // =========================================================================
+
+    #[test]
+    fn test_decision_log_roundtrip() {
+        let dir = std::env::temp_dir().join("trading_agent_rs_test_decision_log");
+        let path = dir.join("test_decisions.json");
+
+        let mut log = DecisionLog::load(&path, None);
+        log.log_decision("AAPL", "2026-05-01", "BUY", "High", "Strong earnings beat");
+        log.log_decision("MSFT", "2026-05-01", "HOLD", "Medium", "Neutral outlook");
+        log.save().unwrap();
+
+        // Reload
+        let log2 = DecisionLog::load(&path, None);
+        assert_eq!(log2.len(), 2);
+        assert_eq!(log2.pending_for_ticker("AAPL").len(), 1);
+        assert_eq!(log2.pending_for_ticker("MSFT").len(), 1);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_decision_log_resolve() {
+        let dir = std::env::temp_dir().join("trading_agent_rs_test_decision_resolve");
+        let path = dir.join("test_resolve.json");
+
+        let mut log = DecisionLog::load(&path, None);
+        log.log_decision("NVDA", "2026-04-15", "BUY", "High", "AI demand strong");
+        log.resolve("NVDA", "2026-04-15", 12.5, 8.3, "Thesis played out well");
+
+        assert_eq!(log.pending_for_ticker("NVDA").len(), 0);
+        assert_eq!(log.resolved_for_ticker("NVDA", 5).len(), 1);
+
+        let resolved = &log.resolved_for_ticker("NVDA", 5)[0];
+        assert_eq!(resolved.realized_return, Some(12.5));
+        assert_eq!(resolved.alpha, Some(8.3));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_decision_log_prune_resolved() {
+        let path = std::env::temp_dir().join("trading_agent_rs_prune.json");
+        let mut log = DecisionLog::load(&path, Some(2));
+
+        // Add 4 entries and resolve 3 of them
+        log.log_decision("A", "2026-01-01", "BUY", "H", "s1");
+        log.log_decision("B", "2026-01-02", "SELL", "M", "s2");
+        log.log_decision("C", "2026-01-03", "HOLD", "L", "s3");
+        log.log_decision("D", "2026-01-04", "BUY", "H", "s4");
+
+        log.resolve("A", "2026-01-01", 5.0, 2.0, "ok");
+        log.resolve("B", "2026-01-02", -3.0, -1.0, "bad");
+        log.resolve("C", "2026-01-03", 0.0, 0.0, "flat");
+
+        // Should keep only 2 resolved (B and C pruned, keep most recent? Actually it prunes oldest first)
+        let resolved_count = log
+            .entries
+            .iter()
+            .filter(|e| e.status == DecisionStatus::Resolved)
+            .count();
+        assert!(resolved_count <= 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_decision_log_format_context() {
+        let path = std::env::temp_dir().join("trading_agent_rs_ctx.json");
+        let mut log = DecisionLog::load(&path, None);
+        log.log_decision("AAPL", "2026-05-01", "BUY", "High", "Strong growth thesis");
+
+        let ctx = log.format_context("AAPL");
+        assert!(ctx.contains("Prior Decision History"));
+        assert!(ctx.contains("Pending"));
+        assert!(ctx.contains("BUY"));
+
+        // Empty for unknown ticker
+        let ctx2 = log.format_context("UNKNOWN");
+        assert!(ctx2.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

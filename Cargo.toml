@@ -1,6 +1,6 @@
 [package]
 name = "trading-agent-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
@@ -34,6 +34,9 @@ regex = "1"
 
 # Anyhow for error handling
 anyhow = "1"
+
+# Platform-specific directories (home dir, config dir)
+dirs = "5"
 
 # Command-line interface
 clap = { version = "4", features = ["derive"] }

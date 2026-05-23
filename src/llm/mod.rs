@@ -292,6 +292,38 @@ pub trait LLMClient: Send + Sync {
 }
 
 // =============================================================================
+// Provider Capability Table
+// =============================================================================
+
+/// Per-provider/model capabilities that control structured output behavior.
+#[derive(Debug, Clone)]
+struct ProviderCapabilities {
+    /// Whether this provider/model supports the `tool_choice` parameter.
+    supports_tool_choice: bool,
+}
+
+impl ProviderCapabilities {
+    /// Determine capabilities from model name and base URL.
+    ///
+    /// DeepSeek V4+ and MiniMax M2.x (via OpenAI-compat path) reject `tool_choice`,
+    /// so we skip it for those. Ollama models also generally don't support it.
+    fn for_model(model: &str, base_url: &str) -> Self {
+        let model_lower = model.to_lowercase();
+        let url_lower = base_url.to_lowercase();
+
+        let supports_tool_choice = !model_lower.contains("deepseek")
+            && !model_lower.starts_with("minimax")
+            && !url_lower.contains("minimax")
+            && !url_lower.contains("ollama")
+            && !url_lower.contains("localhost:11434");
+
+        Self {
+            supports_tool_choice,
+        }
+    }
+}
+
+// =============================================================================
 // OpenAI Client (also used for MiniMax, Ollama, OpenRouter)
 // =============================================================================
 
@@ -300,10 +332,12 @@ pub struct OpenAIClient {
     pub api_key: String,
     pub base_url: String,
     client: reqwest::Client,
+    capabilities: ProviderCapabilities,
 }
 
 impl OpenAIClient {
     pub fn new(model: &str, api_key: &str, base_url: &str) -> Result<Self> {
+        let capabilities = ProviderCapabilities::for_model(model, base_url);
         Ok(Self {
             model: model.to_string(),
             api_key: api_key.to_string(),
@@ -312,6 +346,7 @@ impl OpenAIClient {
                 .timeout(Duration::from_secs(120))
                 .build()
                 .context("Failed to build OpenAI HTTP client")?,
+            capabilities,
         })
     }
 }
@@ -344,6 +379,12 @@ impl LLMClient for OpenAIClient {
                     })
                 })
                 .collect::<Vec<_>>());
+
+            // Only set tool_choice for providers that support it.
+            // DeepSeek V4+, MiniMax M2.x, and Ollama reject this parameter.
+            if self.capabilities.supports_tool_choice {
+                body["tool_choice"] = json!("auto");
+            }
         }
 
         let resp_json = retry_request(|| {
@@ -411,10 +452,12 @@ pub struct AnthropicClient {
     pub api_key: String,
     pub base_url: String,
     client: reqwest::Client,
+    capabilities: ProviderCapabilities,
 }
 
 impl AnthropicClient {
     pub fn new(model: &str, api_key: &str, base_url: &str) -> Result<Self> {
+        let capabilities = ProviderCapabilities::for_model(model, base_url);
         Ok(Self {
             model: model.to_string(),
             api_key: api_key.to_string(),
@@ -423,6 +466,7 @@ impl AnthropicClient {
                 .timeout(Duration::from_secs(120))
                 .build()
                 .context("Failed to build Anthropic HTTP client")?,
+            capabilities,
         })
     }
 }
@@ -454,6 +498,11 @@ impl LLMClient for AnthropicClient {
                 })
                 .collect::<Vec<_>>());
             body["thinking"] = json!({"type": "disabled"});
+
+            // Anthropic supports tool_choice; MiniMax (via Anthropic-compat) may not.
+            if self.capabilities.supports_tool_choice {
+                body["tool_choice"] = json!({"type": "auto"});
+            }
         }
 
         let resp_json = retry_request(|| {
@@ -512,6 +561,10 @@ impl LLMClient for AnthropicClient {
                 })
                 .collect::<Vec<_>>());
             body["thinking"] = json!({"type": "disabled"});
+
+            if self.capabilities.supports_tool_choice {
+                body["tool_choice"] = json!({"type": "auto"});
+            }
         }
 
         let resp_json = retry_request(|| {
@@ -610,8 +663,38 @@ impl LLMClient for AnyLLMClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint_url, parse_anthropic_response, parse_openai_response};
+    use super::{
+        endpoint_url, parse_anthropic_response, parse_openai_response, ProviderCapabilities,
+    };
     use serde_json::json;
+
+    #[test]
+    fn capability_table_supports_tool_choice_for_standard_providers() {
+        let openai = ProviderCapabilities::for_model("gpt-4o", "https://api.openai.com");
+        assert!(openai.supports_tool_choice);
+
+        let anthropic =
+            ProviderCapabilities::for_model("claude-sonnet-4-6", "https://api.anthropic.com");
+        assert!(anthropic.supports_tool_choice);
+    }
+
+    #[test]
+    fn capability_table_skips_tool_choice_for_unsupported() {
+        let deepseek =
+            ProviderCapabilities::for_model("deepseek-chat-v4", "https://api.deepseek.com");
+        assert!(!deepseek.supports_tool_choice);
+
+        let minimax =
+            ProviderCapabilities::for_model("MiniMax-M2.7", "https://api.minimaxi.com/anthropic");
+        assert!(!minimax.supports_tool_choice);
+
+        let ollama = ProviderCapabilities::for_model("llama3", "http://localhost:11434");
+        assert!(!ollama.supports_tool_choice);
+
+        let remote_ollama =
+            ProviderCapabilities::for_model("qwen2", "http://myserver:8080/ollama/v1");
+        assert!(!remote_ollama.supports_tool_choice);
+    }
 
     #[test]
     fn endpoint_url_avoids_duplicate_version_path() {

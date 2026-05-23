@@ -14,6 +14,45 @@ const NEWS_EXCERPT_LIMIT: usize = 8;
 const NEWS_EXCERPT_CHARS: usize = 900;
 const YAHOO_USER_AGENT: &str = "Mozilla/5.0";
 
+// =============================================================================
+// Regional Benchmark Mapping
+// =============================================================================
+
+/// Returns the appropriate benchmark index ticker for a given stock ticker,
+/// based on the exchange suffix. Falls back to SPY (S&P 500) for US tickers.
+///
+/// Configurable via `TRADING_AGENT_BENCHMARK` / `TAGENT_BENCHMARK` env var
+/// which overrides the automatic detection.
+pub fn benchmark_for_ticker(ticker: &str) -> String {
+    // Check for explicit override first
+    if let Ok(override_bm) =
+        std::env::var("TRADING_AGENT_BENCHMARK").or_else(|_| std::env::var("TAGENT_BENCHMARK"))
+    {
+        if !override_bm.trim().is_empty() {
+            return override_bm.trim().to_string();
+        }
+    }
+
+    // Extract exchange suffix (e.g., ".NS" from "RELIANCE.NS")
+    let suffix = ticker.rfind('.').map(|i| &ticker[i..]).unwrap_or("");
+
+    match suffix.to_uppercase().as_str() {
+        ".NS" => "^NSEI".to_string(),             // India NSE → Nifty 50
+        ".BO" => "^BSESN".to_string(),            // India BSE → Sensex
+        ".T" => "^N225".to_string(),              // Tokyo → Nikkei 225
+        ".HK" => "^HSI".to_string(),              // Hong Kong → Hang Seng
+        ".L" => "^FTSE".to_string(),              // London → FTSE 100
+        ".TO" | ".V" => "^GSPTSE".to_string(),    // Toronto/TSX Venture → S&P/TSX
+        ".AX" => "^AXJO".to_string(),             // Australia → ASX 200
+        ".SS" | ".SZ" => "000001.SS".to_string(), // Shanghai/Shenzhen → SSE Composite
+        ".SH" => "000001.SS".to_string(),         // Shanghai alt suffix
+        ".KS" | ".KQ" => "^KS11".to_string(),     // Korea KOSPI/KOSDAQ
+        ".TW" => "^TWII".to_string(),             // Taiwan → TAIEX
+        ".DE" | ".F" | ".PA" | ".AS" | ".MI" | ".MC" | ".BR" => "^STOXX50E".to_string(), // Eurozone → Euro Stoxx 50
+        _ => "SPY".to_string(), // US default
+    }
+}
+
 /// Stock quote data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
@@ -748,6 +787,41 @@ fn excerpt_around_terms(text: &str, terms: &[&str], max_chars: usize) -> Option<
 }
 
 /// Tool execution router - routes tool calls to appropriate data sources
+/// Validate a ticker symbol to prevent path-traversal and injection attacks.
+///
+/// Allows alphanumeric characters, dots (for exchange suffixes like `.NS`, `.T`),
+/// hyphens (e.g. `BRK-B`), carets (e.g. `^GSPC`), and underscores.
+/// Rejects `..`, `/`, `\`, null bytes, and any other suspicious characters.
+pub fn validate_ticker(ticker: &str) -> Result<()> {
+    if ticker.is_empty() {
+        anyhow::bail!("Ticker symbol cannot be empty");
+    }
+    if ticker.len() > 20 {
+        anyhow::bail!("Ticker symbol too long (max 20 chars): '{}'", ticker);
+    }
+    if ticker.contains("..")
+        || ticker.contains('/')
+        || ticker.contains('\\')
+        || ticker.contains('\0')
+    {
+        anyhow::bail!(
+            "Invalid ticker '{}': contains path-traversal characters",
+            ticker
+        );
+    }
+    // Allow only safe characters: alphanumeric, dot, hyphen, caret, underscore
+    if !ticker
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '^' | '_'))
+    {
+        anyhow::bail!(
+            "Invalid ticker '{}': contains disallowed characters",
+            ticker
+        );
+    }
+    Ok(())
+}
+
 pub async fn execute_tool(
     tool_name: &str,
     args: &serde_json::Value,
@@ -760,6 +834,7 @@ pub async fn execute_tool(
     match tool {
         ToolName::GetStockData => {
             let symbol = required_tool_arg(args, "symbol")?;
+            validate_ticker(symbol)?;
             let raw_start = optional_tool_arg(args, "start_date");
             let raw_end = optional_tool_arg(args, "end_date");
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -776,6 +851,7 @@ pub async fn execute_tool(
         }
         ToolName::GetIndicators => {
             let symbol = required_tool_arg(args, "symbol")?;
+            validate_ticker(symbol)?;
             let curr_date = required_tool_arg(args, "curr_date")?;
             let look_back = args
                 .get("look_back_days")
@@ -785,16 +861,19 @@ pub async fn execute_tool(
         }
         ToolName::GetFinancials => {
             let ticker = required_tool_arg(args, "ticker")?;
+            validate_ticker(ticker)?;
             client.get_fundamentals(ticker).await
         }
         ToolName::GetNews => {
             let ticker = required_tool_arg(args, "ticker")?;
+            validate_ticker(ticker)?;
             let start_date = optional_tool_arg(args, "start_date");
             let end_date = optional_tool_arg(args, "end_date");
             client.get_news(ticker, start_date, end_date).await
         }
         ToolName::GetGlobalNews => {
             let curr_date = required_tool_arg(args, "curr_date")?;
+            // ^GSPC is a hardcoded safe value, no validation needed
             client.get_news("^GSPC", curr_date, curr_date).await
         }
     }
@@ -822,6 +901,25 @@ mod tests {
             47.5, 48.0, 47.75, 48.0, 48.5, 49.0,
         ];
         assert!(YahooFinanceClient::calculate_rsi(&prices, 14).is_some());
+    }
+
+    #[test]
+    fn test_benchmark_for_ticker_regional() {
+        assert_eq!(benchmark_for_ticker("RELIANCE.NS"), "^NSEI");
+        assert_eq!(benchmark_for_ticker("7203.T"), "^N225");
+        assert_eq!(benchmark_for_ticker("0700.HK"), "^HSI");
+        assert_eq!(benchmark_for_ticker("VOD.L"), "^FTSE");
+        assert_eq!(benchmark_for_ticker("SHOP.TO"), "^GSPTSE");
+        assert_eq!(benchmark_for_ticker("CBA.AX"), "^AXJO");
+        assert_eq!(benchmark_for_ticker("600519.SS"), "000001.SS");
+        assert_eq!(benchmark_for_ticker("SAP.DE"), "^STOXX50E");
+    }
+
+    #[test]
+    fn test_benchmark_for_ticker_us_default() {
+        assert_eq!(benchmark_for_ticker("AAPL"), "SPY");
+        assert_eq!(benchmark_for_ticker("NVDA"), "SPY");
+        assert_eq!(benchmark_for_ticker("BRK-B"), "SPY");
     }
 
     #[test]
@@ -920,5 +1018,32 @@ mod tests {
         assert!(news.contains("Microsoft"));
         assert!(news.contains("US$9.70") || news.contains("9.70"));
         assert!(news.contains("B300") || news.contains("50,000"));
+    }
+
+    #[test]
+    fn test_validate_ticker_accepts_valid() {
+        assert!(validate_ticker("AAPL").is_ok());
+        assert!(validate_ticker("BRK-B").is_ok());
+        assert!(validate_ticker("7203.T").is_ok());
+        assert!(validate_ticker("^GSPC").is_ok());
+        assert!(validate_ticker("RELIANCE.NS").is_ok());
+        assert!(validate_ticker("0700.HK").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ticker_rejects_traversal() {
+        assert!(validate_ticker("../etc/passwd").is_err());
+        assert!(validate_ticker("AAPL/../../secret").is_err());
+        assert!(validate_ticker("AAPL\\..\\secret").is_err());
+        assert!(validate_ticker("..").is_err());
+    }
+
+    #[test]
+    fn test_validate_ticker_rejects_special_chars() {
+        assert!(validate_ticker("").is_err());
+        assert!(validate_ticker("AAPL;rm -rf /").is_err());
+        assert!(validate_ticker("A\0APL").is_err());
+        assert!(validate_ticker("AAPL MSFT").is_err());
+        assert!(validate_ticker("A".repeat(21).as_str()).is_err());
     }
 }

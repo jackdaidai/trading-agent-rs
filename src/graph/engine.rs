@@ -6,7 +6,7 @@
 use crate::data::yfinance::{self, YahooFinanceClient};
 use crate::graph::state::{AgentState, InvestDebateState, RiskDebateState};
 use crate::llm::{AnthropicContentBlock, AnthropicMessage, LLMClient, Tool};
-use crate::memory::{BM25Memory, MemoryMatch};
+use crate::memory::{BM25Memory, DecisionLog, MemoryMatch};
 use crate::tools::{ToolName, ToolRegistry};
 use anyhow::Result;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ const DECISION_CALIBRATION: &str = r#"Decision calibration:
 - Do not assign numeric scenario probabilities unless they come from an explicit quantitative model; use qualitative scenario labels instead.
 - If market cap, revenue, EPS, debt, cash flow, or comparable valuation data are not observed, avoid "high-conviction" language and cap confidence at Medium.
 - A BUY at the current price requires more than a strong business thesis: current entry quality must also be attractive after considering support/resistance, execution risk, financing/dilution, and missing fundamentals.
-- When the business thesis is strong but entry/valuation evidence is incomplete, prefer HOLD, WATCH, or ACCUMULATE ON PULLBACK rather than an unconditional BUY.
+- When the business thesis is strong but entry/valuation evidence is incomplete, prefer OVERWEIGHT or HOLD rather than an unconditional BUY. Use UNDERWEIGHT when risks outweigh the thesis but liquidation is premature.
 - Do not say a large contract eliminates execution risk; it validates demand but deployment, financing, concentration, and revenue-recognition risks remain.
 - Keep position sizing qualitative and research-oriented unless the user supplied a risk profile; avoid exact portfolio-allocation percentages and personalized sizing by investor profile.
 "#;
@@ -78,6 +78,7 @@ pub struct GraphEngine {
     bull_memory: RwLock<BM25Memory>,
     bear_memory: RwLock<BM25Memory>,
     trader_memory: RwLock<BM25Memory>,
+    decision_log: RwLock<DecisionLog>,
 }
 
 impl GraphEngine {
@@ -86,6 +87,8 @@ impl GraphEngine {
         llm_quick: Arc<dyn LLMClient>,
         llm_deep: Arc<dyn LLMClient>,
     ) -> Self {
+        let decision_log_path = DecisionLog::default_path();
+        let decision_log = DecisionLog::load(&decision_log_path, Some(100));
         Self {
             config,
             llm_quick,
@@ -95,6 +98,7 @@ impl GraphEngine {
             bull_memory: RwLock::new(BM25Memory::new("bull")),
             bear_memory: RwLock::new(BM25Memory::new("bear")),
             trader_memory: RwLock::new(BM25Memory::new("trader")),
+            decision_log: RwLock::new(decision_log),
         }
     }
 
@@ -145,6 +149,9 @@ impl GraphEngine {
         tracing::info!("Phase 6 done in {:.1}s", t.elapsed().as_secs_f64());
         state.final_trade_decision = decision;
 
+        // ========== Persist Decision ==========
+        self.persist_decision(&state).await;
+
         tracing::info!("Analysis complete for {}", state.company_of_interest);
         Ok(state)
     }
@@ -185,17 +192,31 @@ impl GraphEngine {
                     .to_string()
             })
             .unwrap_or_else(|_| date.to_string());
+
+        let benchmark = yfinance::benchmark_for_ticker(ticker);
+        let benchmark_instruction = if benchmark != ticker {
+            format!(
+                r#"Also fetch stock data for the benchmark "{benchmark}" over the same period to compare relative performance (alpha).
+            "#
+            )
+        } else {
+            String::new()
+        };
+
         let prompt = format!(
             r#"You are a market analyst. Analyze the stock data for {ticker} on {date}.
+            Regional benchmark for alpha comparison: {benchmark}
 
             Use the get_stock_data tool with start_date="{start}" and end_date="{end}" to get recent OHLCV data.
             Use the get_indicators tool with curr_date="{end}" to get RSI, MACD, Bollinger Bands.
+            {benchmark_instruction}
 
             Provide a concise market analysis covering:
             - Current price trend
             - Volume analysis
             - Key technical indicators (RSI, MACD, Bollinger position)
             - Support/resistance levels if apparent
+            - Relative performance vs {benchmark} (alpha)
 
             End with: FINAL MARKET ANALYSIS: **SUMMARY**"#
         );
@@ -437,11 +458,11 @@ impl GraphEngine {
 
             Provide a comprehensive investment plan that:
             - Weighs the bull and bear arguments
-            - Provides a clear BUY/HOLD/SELL recommendation
+            - Provides a clear rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
             - Outlines specific strategic actions
             - Justifies the reasoning
 
-            End with: INVESTMENT DECISION: **BUY/HOLD/SELL** with confidence level
+            End with: INVESTMENT DECISION: **{{BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL}}** with confidence level
             "#,
             company = state.company_of_interest,
             history = state.investment_debate_state.history,
@@ -661,6 +682,12 @@ impl GraphEngine {
     // -------------------------------------------------------------------------
 
     async fn run_portfolio_manager(&self, state: &AgentState) -> Result<String> {
+        let decision_history = self
+            .decision_log
+            .read()
+            .await
+            .format_context(&state.company_of_interest);
+
         let prompt = format!(
             r#"You are a portfolio manager making the final trading decision for {company}.
 
@@ -677,19 +704,21 @@ impl GraphEngine {
             News: {news}
             Fundamentals: {fundamentals}
 
+            {decision_history}
+
             {evidence_discipline}
 
             {decision_calibration}
 
             Provide your final decision with:
-            - Rating (BUY/HOLD/SELL/OVERWEIGHT/UNDERWEIGHT)
+            - Rating: one of BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
             - Executive summary
             - Investment thesis
             - Current price judgment for new money, existing holders, adding, and reducing/selling
             - Evidence quality and data gaps, especially whether valuation is supported by observed financials or only by external targets
             - Key risks and monitoring points
 
-            Avoid personalized allocation guidance. End with: FINAL RATING: **{{RATING}}** with confidence level and 1-sentence justification
+            Avoid personalized allocation guidance. End with: FINAL RATING: **{{BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL}}** with confidence level and 1-sentence justification
             "#,
             company = state.company_of_interest,
             risk_debate = state.risk_debate_state.history,
@@ -699,11 +728,36 @@ impl GraphEngine {
             sentiment = state.sentiment_report,
             news = state.news_report,
             fundamentals = state.fundamentals_report,
+            decision_history = decision_history,
             evidence_discipline = EVIDENCE_DISCIPLINE,
             decision_calibration = DECISION_CALIBRATION,
         );
 
         self.llm_deep.complete(&prompt).await
+    }
+
+    // -------------------------------------------------------------------------
+    // Decision persistence
+    // -------------------------------------------------------------------------
+
+    /// Extract rating and confidence from the final decision text and persist.
+    async fn persist_decision(&self, state: &AgentState) {
+        let decision_text = &state.final_trade_decision;
+        let (rating, confidence) = extract_rating_and_confidence(decision_text);
+        // Use first ~300 chars as summary
+        let summary: String = decision_text.chars().take(300).collect();
+
+        let mut log = self.decision_log.write().await;
+        log.log_decision(
+            &state.company_of_interest,
+            &state.trade_date,
+            &rating,
+            &confidence,
+            &summary,
+        );
+        if let Err(e) = log.save() {
+            tracing::warn!("Failed to persist decision log: {}", e);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -812,4 +866,40 @@ struct AnalystResults {
     social: String,
     news: String,
     fundamentals: String,
+}
+
+/// Extract rating and confidence from the final decision markdown.
+/// Looks for patterns like `FINAL RATING: **BUY**` and `confidence: High`.
+fn extract_rating_and_confidence(text: &str) -> (String, String) {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static RATING_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)FINAL\s+RATING:\s*\*{0,2}(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\*{0,2}")
+            .unwrap()
+    });
+    static CONFIDENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)confidence(?:\s+level)?[:\s]+\*{0,2}(High|Medium|Low)\*{0,2}").unwrap()
+    });
+
+    let rating = RATING_RE
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_uppercase())
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+
+    let confidence = CONFIDENCE_RE
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| {
+            let s = m.as_str();
+            let mut c = s.chars();
+            match c.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                None => s.to_string(),
+            }
+        })
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    (rating, confidence)
 }
