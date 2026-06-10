@@ -12,9 +12,11 @@ use std::sync::LazyLock;
 
 static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9]+\b").unwrap());
 
+/// Cap on stored memories per agent — oldest entries are dropped beyond this.
+const MAX_MEMORY_ENTRIES: usize = 500;
+
 /// A stored memory entry with situation and recommendation
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct MemoryEntry {
     pub situation: String,
     pub recommendation: String,
@@ -22,7 +24,6 @@ pub struct MemoryEntry {
 
 /// On-disk format — only raw data, IDF/tokens recomputed on load
 #[derive(Serialize, Deserialize)]
-#[allow(dead_code)]
 struct MemoryStore {
     entries: Vec<MemoryEntry>,
 }
@@ -30,12 +31,8 @@ struct MemoryStore {
 /// BM25-based memory system
 pub struct BM25Memory {
     name: String,
-    // Populated when memories are added or loaded. Runtime starts with empty memory today,
-    // but persistence helpers use this to compute BM25 average document length.
-    #[allow(dead_code)]
     documents: Vec<String>,
     recommendations: Vec<String>,
-    #[allow(dead_code)]
     doc_lengths: Vec<usize>,
     avgdl: f64,
     idf: HashMap<String, f64>,
@@ -55,8 +52,16 @@ impl BM25Memory {
         }
     }
 
+    /// Default on-disk location: `~/.trading-agent-rs/memory/<name>.json`
+    pub fn default_path(name: &str) -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".trading-agent-rs")
+            .join("memory")
+            .join(format!("{name}.json"))
+    }
+
     /// Load from a JSON file, or create empty if file doesn't exist / is invalid.
-    #[allow(dead_code)]
     pub fn from_file(name: &str, path: &Path) -> Self {
         let mut mem = Self::new(name);
         if let Ok(data) = std::fs::read_to_string(path) {
@@ -70,7 +75,6 @@ impl BM25Memory {
     }
 
     /// Persist current entries to a JSON file.
-    #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let store = MemoryStore {
             entries: self
@@ -100,18 +104,23 @@ impl BM25Memory {
     }
 
     /// Add a situation and its recommendation to memory
-    #[allow(dead_code)]
     pub fn add(&mut self, situation: &str, recommendation: &str) {
         let tokens = self.tokenize(situation);
         self.documents.push(situation.to_string());
         self.recommendations.push(recommendation.to_string());
         self.tokenized_docs.push(tokens.clone());
         self.doc_lengths.push(tokens.len());
+        if self.documents.len() > MAX_MEMORY_ENTRIES {
+            let overflow = self.documents.len() - MAX_MEMORY_ENTRIES;
+            self.documents.drain(..overflow);
+            self.recommendations.drain(..overflow);
+            self.tokenized_docs.drain(..overflow);
+            self.doc_lengths.drain(..overflow);
+        }
         self.recompute_idf();
     }
 
     /// Compute IDF values from document frequencies
-    #[allow(dead_code)]
     fn recompute_idf(&mut self) {
         let n = self.documents.len() as f64;
         if n == 0.0 {
@@ -332,6 +341,8 @@ impl DecisionLog {
     }
 
     /// Append a new pending decision after a completed analysis.
+    /// Re-running the same ticker+date replaces the prior pending entry
+    /// instead of accumulating duplicates.
     pub fn log_decision(
         &mut self,
         ticker: &str,
@@ -340,6 +351,11 @@ impl DecisionLog {
         confidence: &str,
         summary: &str,
     ) {
+        self.entries.retain(|e| {
+            !(e.status == DecisionStatus::Pending
+                && e.ticker.eq_ignore_ascii_case(ticker)
+                && e.date == date)
+        });
         let entry = DecisionEntry {
             ticker: ticker.to_string(),
             date: date.to_string(),
@@ -407,7 +423,9 @@ impl DecisionLog {
 
     /// Format decision history as context for prompts.
     pub fn format_context(&self, ticker: &str) -> String {
-        let pending = self.pending_for_ticker(ticker);
+        let pending_all = self.pending_for_ticker(ticker);
+        // Cap prompt context to the 5 most recent pending decisions
+        let pending = &pending_all[pending_all.len().saturating_sub(5)..];
         let resolved = self.resolved_for_ticker(ticker, 5);
 
         if pending.is_empty() && resolved.is_empty() {
@@ -434,7 +452,7 @@ impl DecisionLog {
 
         if !pending.is_empty() {
             ctx.push_str("### Pending (awaiting resolution)\n");
-            for e in &pending {
+            for e in pending {
                 ctx.push_str(&format!(
                     "- [{date}] {rating} (confidence: {conf}): {summary}\n",
                     date = e.date,
@@ -596,6 +614,18 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_caps_entries_at_max() {
+        let mut mem = BM25Memory::new("test");
+        for i in 0..(MAX_MEMORY_ENTRIES + 10) {
+            mem.add(&format!("doc number {}", i), "rec");
+        }
+        assert_eq!(mem.len(), MAX_MEMORY_ENTRIES);
+        // Oldest entries were dropped — doc 0 should be gone
+        let results = mem.get_memories(&format!("doc number {}", MAX_MEMORY_ENTRIES + 9), 1);
+        assert!(!results.is_empty());
+    }
+
+    #[test]
     fn test_from_file_missing_file() {
         let mem = BM25Memory::from_file("test", Path::new("/nonexistent/path.json"));
         assert!(mem.is_empty());
@@ -668,6 +698,38 @@ mod tests {
             .filter(|e| e.status == DecisionStatus::Resolved)
             .count();
         assert!(resolved_count <= 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_decision_log_rerun_replaces_pending() {
+        let path = std::env::temp_dir().join("trading_agent_rs_rerun.json");
+        let mut log = DecisionLog::load(&path, None);
+        log.log_decision("AAPL", "2026-05-01", "BUY", "High", "first run");
+        log.log_decision("AAPL", "2026-05-01", "HOLD", "Medium", "second run");
+
+        let pending = log.pending_for_ticker("AAPL");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].rating, "HOLD");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_format_context_caps_pending_entries() {
+        let path = std::env::temp_dir().join("trading_agent_rs_cap.json");
+        let mut log = DecisionLog::load(&path, None);
+        for i in 1..=8 {
+            log.log_decision("NVDA", &format!("2026-01-{:02}", i), "BUY", "High", "s");
+        }
+
+        let ctx = log.format_context("NVDA");
+        // Only the 5 most recent pending decisions appear
+        assert!(!ctx.contains("2026-01-01"));
+        assert!(!ctx.contains("2026-01-03"));
+        assert!(ctx.contains("2026-01-04"));
+        assert!(ctx.contains("2026-01-08"));
 
         let _ = std::fs::remove_file(&path);
     }

@@ -95,9 +95,18 @@ impl GraphEngine {
             llm_deep,
             tool_registry: ToolRegistry::new(),
             yfinance: YahooFinanceClient::new(),
-            bull_memory: RwLock::new(BM25Memory::new("bull")),
-            bear_memory: RwLock::new(BM25Memory::new("bear")),
-            trader_memory: RwLock::new(BM25Memory::new("trader")),
+            bull_memory: RwLock::new(BM25Memory::from_file(
+                "bull",
+                &BM25Memory::default_path("bull"),
+            )),
+            bear_memory: RwLock::new(BM25Memory::from_file(
+                "bear",
+                &BM25Memory::default_path("bear"),
+            )),
+            trader_memory: RwLock::new(BM25Memory::from_file(
+                "trader",
+                &BM25Memory::default_path("trader"),
+            )),
             decision_log: RwLock::new(decision_log),
         }
     }
@@ -290,7 +299,7 @@ impl GraphEngine {
 
             {decision_calibration}
 
-            Use the get_financials tool (with report_type: overview, balance_sheet, cashflow, income_statement, or insider_transactions) to gather data.
+            Use the get_financials tool to gather the available company overview data (price, 52-week range, sector, industry). Detailed financial statements are not available natively; treat metrics that are not returned as not observed.
 
             Provide a concise fundamentals analysis covering:
             - Business model and competitive position
@@ -747,16 +756,33 @@ impl GraphEngine {
         // Use first ~300 chars as summary
         let summary: String = decision_text.chars().take(300).collect();
 
-        let mut log = self.decision_log.write().await;
-        log.log_decision(
-            &state.company_of_interest,
-            &state.trade_date,
-            &rating,
-            &confidence,
-            &summary,
-        );
-        if let Err(e) = log.save() {
-            tracing::warn!("Failed to persist decision log: {}", e);
+        {
+            let mut log = self.decision_log.write().await;
+            log.log_decision(
+                &state.company_of_interest,
+                &state.trade_date,
+                &rating,
+                &confidence,
+                &summary,
+            );
+            if let Err(e) = log.save() {
+                tracing::warn!("Failed to persist decision log: {}", e);
+            }
+        }
+
+        // Store this run as a retrievable "past lesson" for future debates.
+        let situation = state.situation_summary();
+        let lesson = format!("{} (confidence: {}): {}", rating, confidence, summary);
+        for (memory, name) in [
+            (&self.bull_memory, "bull"),
+            (&self.bear_memory, "bear"),
+            (&self.trader_memory, "trader"),
+        ] {
+            let mut mem = memory.write().await;
+            mem.add(&situation, &lesson);
+            if let Err(e) = mem.save(&BM25Memory::default_path(name)) {
+                tracing::warn!("Failed to persist {} memory: {}", name, e);
+            }
         }
     }
 
@@ -834,7 +860,14 @@ impl GraphEngine {
             }
         }
 
-        // Max rounds reached — final completion to synthesize with available data
+        // Max rounds reached — explicitly instruct the model to synthesize,
+        // otherwise it may answer with another tool_use and empty content.
+        messages.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![AnthropicContentBlock::Text(
+                "Tool budget exhausted. Do not request any more tools; write your final analysis now using the data gathered so far.".to_string(),
+            )],
+        });
         let final_response = self.llm_quick.complete_messages(messages, tools).await?;
         Ok(final_response.content)
     }

@@ -213,23 +213,20 @@ impl YahooFinanceClient {
         let opens = quote
             .get("open")
             .and_then(|v| v.as_array())
-            .unwrap_or(timestamps);
+            .context("No open prices in Yahoo Finance chart response")?;
         let highs = quote
             .get("high")
             .and_then(|v| v.as_array())
-            .unwrap_or(timestamps);
+            .context("No high prices in Yahoo Finance chart response")?;
         let lows = quote
             .get("low")
             .and_then(|v| v.as_array())
-            .unwrap_or(timestamps);
+            .context("No low prices in Yahoo Finance chart response")?;
         let closes = quote
             .get("close")
             .and_then(|v| v.as_array())
-            .unwrap_or(timestamps);
-        let volumes = quote
-            .get("volume")
-            .and_then(|v| v.as_array())
-            .unwrap_or(timestamps);
+            .context("No close prices in Yahoo Finance chart response")?;
+        let volumes = quote.get("volume").and_then(|v| v.as_array());
 
         let mut quotes = Vec::new();
         for (i, ts) in timestamps.iter().enumerate() {
@@ -248,7 +245,10 @@ impl YahooFinanceClient {
             let Some(close) = closes.get(i).and_then(|v| v.as_f64()) else {
                 continue;
             };
-            let volume = volumes.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
+            let volume = volumes
+                .and_then(|a| a.get(i))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
 
             quotes.push(Quote {
                 symbol: symbol.to_uppercase(),
@@ -313,6 +313,13 @@ impl YahooFinanceClient {
 
         if let Some(rsi) = Self::calculate_rsi(&closes, 14) {
             output += &format!("- **RSI (14)**: {:.2}\n", rsi);
+        }
+        if let Some((macd_line, signal, hist)) = macd(&closes) {
+            output += &format!("- **MACD (12,26)**: {:.2}\n", macd_line);
+            output += &format!("- **MACD Signal (9)**: {:.2}\n", signal);
+            output += &format!("- **MACD Histogram**: {:.2}\n", hist);
+        } else {
+            output += "- **MACD**: insufficient history (needs at least 34 trading days)\n";
         }
         if let Some(sma10) = simple_moving_average(&closes, 10) {
             output += &format!("- **SMA (10)**: {:.2}\n", sma10);
@@ -566,6 +573,41 @@ fn simple_moving_average(values: &[f64], period: usize) -> Option<f64> {
         return None;
     }
     Some(values.iter().rev().take(period).sum::<f64>() / period as f64)
+}
+
+/// EMA over `values`, seeded with the SMA of the first `period` points.
+/// Returns one EMA value per close starting at index `period - 1`.
+fn ema_series(values: &[f64], period: usize) -> Option<Vec<f64>> {
+    if period == 0 || values.len() < period {
+        return None;
+    }
+    let alpha = 2.0 / (period as f64 + 1.0);
+    let mut ema = values[..period].iter().sum::<f64>() / period as f64;
+    let mut series = Vec::with_capacity(values.len() - period + 1);
+    series.push(ema);
+    for value in &values[period..] {
+        ema = alpha * value + (1.0 - alpha) * ema;
+        series.push(ema);
+    }
+    Some(series)
+}
+
+/// MACD(12,26,9): returns (macd line, signal line, histogram) for the latest
+/// close. Requires at least 34 data points (26 for the slow EMA + 9 for the
+/// signal EMA, overlapping by one).
+fn macd(closes: &[f64]) -> Option<(f64, f64, f64)> {
+    let ema12 = ema_series(closes, 12)?;
+    let ema26 = ema_series(closes, 26)?;
+    // ema12[j + 14] and ema26[j] correspond to the same close index (j + 25).
+    let macd_line: Vec<f64> = ema26
+        .iter()
+        .enumerate()
+        .map(|(j, e26)| ema12[j + 14] - e26)
+        .collect();
+    let signal_series = ema_series(&macd_line, 9)?;
+    let macd_last = *macd_line.last()?;
+    let signal_last = *signal_series.last()?;
+    Some((macd_last, signal_last, macd_last - signal_last))
 }
 
 fn bollinger_bands(values: &[f64], period: usize) -> Option<(f64, f64, f64)> {
@@ -853,10 +895,11 @@ pub async fn execute_tool(
             let symbol = required_tool_arg(args, "symbol")?;
             validate_ticker(symbol)?;
             let curr_date = required_tool_arg(args, "curr_date")?;
+            // 90 calendar days ≈ 62 trading days — enough history for MACD(12,26,9).
             let look_back = args
                 .get("look_back_days")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(30) as i32;
+                .unwrap_or(90) as i32;
             client.get_indicators(symbol, curr_date, look_back).await
         }
         ToolName::GetFinancials => {
@@ -942,6 +985,63 @@ mod tests {
     fn test_encode_component() {
         assert_eq!(encode_component("^GSPC"), "%5EGSPC");
         assert_eq!(encode_component("BRK-B"), "BRK-B");
+    }
+
+    #[test]
+    fn test_parse_chart_quotes_rejects_missing_price_arrays() {
+        // "open" array absent — must error, not substitute timestamps as prices
+        let json = serde_json::json!({
+            "chart": {"result": [{
+                "timestamp": [1700000000i64],
+                "indicators": {"quote": [{
+                    "high": [2.0], "low": [0.5], "close": [1.5], "volume": [100]
+                }]}
+            }]}
+        });
+        let err = YahooFinanceClient::parse_chart_quotes(&json, "TEST")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("open"));
+    }
+
+    #[test]
+    fn test_parse_chart_quotes_missing_volume_defaults_to_zero() {
+        let json = serde_json::json!({
+            "chart": {"result": [{
+                "timestamp": [1700000000i64],
+                "indicators": {"quote": [{
+                    "open": [1.0], "high": [2.0], "low": [0.5], "close": [1.5]
+                }]}
+            }]}
+        });
+        let quotes = YahooFinanceClient::parse_chart_quotes(&json, "test").unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].open, 1.0);
+        assert_eq!(quotes[0].volume, 0);
+        assert_eq!(quotes[0].symbol, "TEST");
+    }
+
+    #[test]
+    fn test_macd_insufficient_history() {
+        let values: Vec<f64> = (1..=20).map(|v| v as f64).collect();
+        assert!(macd(&values).is_none());
+    }
+
+    #[test]
+    fn test_macd_constant_prices_is_zero() {
+        let values = vec![50.0; 40];
+        let (m, s, h) = macd(&values).unwrap();
+        assert!(m.abs() < 1e-9);
+        assert!(s.abs() < 1e-9);
+        assert!(h.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_macd_uptrend_is_positive() {
+        let values: Vec<f64> = (1..=60).map(|v| v as f64).collect();
+        let (m, s, _h) = macd(&values).unwrap();
+        assert!(m > 0.0);
+        assert!(s > 0.0);
     }
 
     #[test]

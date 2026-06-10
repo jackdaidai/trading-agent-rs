@@ -76,28 +76,25 @@ pub fn get_all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "get_indicators".to_string(),
-            description: "Get technical indicators (RSI, MACD, Bollinger, etc.)".to_string(),
+            description: "Get technical indicators (RSI, SMA, MACD, Bollinger Bands)".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string", "description": "Stock ticker symbol"},
-                    "indicator": {"type": "string", "description": "Comma-separated indicators"},
                     "curr_date": {"type": "string", "description": "Current date"},
-                    "look_back_days": {"type": "integer", "description": "Lookback period", "default": 30}
+                    "look_back_days": {"type": "integer", "description": "Lookback period in calendar days", "default": 90}
                 },
-                "required": ["symbol", "indicator", "curr_date"]
+                "required": ["symbol", "curr_date"]
             }),
         },
-        // Financials (unified)
+        // Financials (company overview)
         Tool {
             name: "get_financials".to_string(),
-            description: "Get company financial data. Use report_type to select: overview, balance_sheet, cashflow, income_statement, or insider_transactions.".to_string(),
+            description: "Get company overview data: current price, 52-week range, company name, sector, industry. Detailed financial statements (balance sheet, cash flow, income statement) are not available.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "ticker": {"type": "string", "description": "Stock ticker"},
-                    "report_type": {"type": "string", "description": "One of: overview, balance_sheet, cashflow, income_statement, insider_transactions", "default": "overview"},
-                    "curr_date": {"type": "string", "description": "Current date"}
+                    "ticker": {"type": "string", "description": "Stock ticker"}
                 },
                 "required": ["ticker"]
             }),
@@ -122,9 +119,7 @@ pub fn get_all_tools() -> Vec<Tool> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "curr_date": {"type": "string", "description": "Current date"},
-                    "look_back_days": {"type": "integer", "description": "Days to look back", "default": 7},
-                    "limit": {"type": "integer", "description": "Number of articles", "default": 5}
+                    "curr_date": {"type": "string", "description": "Current date"}
                 },
                 "required": ["curr_date"]
             }),

@@ -197,7 +197,11 @@ fn parse_anthropic_response(resp_json: &Value) -> Result<LLMResponse> {
     for block in blocks {
         match required_str(block, "type", "Anthropic content block")? {
             "text" => {
-                content.push_str(required_str(block, "text", "Anthropic text content block")?);
+                // Tolerate empty text blocks — Anthropic-compatible providers
+                // (MiniMax, z.ai) can emit them alongside tool_use blocks.
+                if let Some(text) = optional_str(block, "text") {
+                    content.push_str(text);
+                }
             }
             "tool_use" => {
                 tool_calls.push(ToolCall {
@@ -767,6 +771,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing content array"));
+    }
+
+    #[test]
+    fn parse_anthropic_response_tolerates_empty_text_blocks() {
+        let response = json!({
+            "content": [
+                {"type": "text", "text": ""},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "get_news",
+                    "input": {"ticker": "MSFT"}
+                }
+            ]
+        });
+
+        let parsed = parse_anthropic_response(&response).unwrap();
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.tool_calls.unwrap().len(), 1);
     }
 
     #[test]
