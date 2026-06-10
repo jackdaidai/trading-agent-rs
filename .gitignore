@@ -13,6 +13,7 @@
 
 # Generated analysis outputs
 /reports/
+/tagent-results/
 batch-*.txt
 benchmark-*.txt
 
