@@ -373,8 +373,15 @@ impl DecisionLog {
         self.prune_resolved();
     }
 
+    /// All pending decisions across tickers (oldest first).
+    pub fn pending(&self) -> Vec<&DecisionEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == DecisionStatus::Pending)
+            .collect()
+    }
+
     /// Resolve a pending entry with outcome data.
-    #[allow(dead_code)]
     pub fn resolve(
         &mut self,
         ticker: &str,
@@ -698,6 +705,21 @@ mod tests {
             .filter(|e| e.status == DecisionStatus::Resolved)
             .count();
         assert!(resolved_count <= 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_decision_log_pending_lists_all_tickers() {
+        let path = std::env::temp_dir().join("trading_agent_rs_pending_all.json");
+        let mut log = DecisionLog::load(&path, None);
+        log.log_decision("AAPL", "2026-05-01", "BUY", "High", "s1");
+        log.log_decision("MSFT", "2026-05-02", "HOLD", "Medium", "s2");
+        log.resolve("AAPL", "2026-05-01", 1.0, 0.5, "done");
+
+        let pending = log.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].ticker, "MSFT");
 
         let _ = std::fs::remove_file(&path);
     }

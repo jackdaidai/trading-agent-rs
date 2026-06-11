@@ -38,6 +38,8 @@ enum Command {
     },
     /// List supported LLM providers and their environment variables.
     Providers,
+    /// Score past pending decisions against realized returns and record lessons.
+    Resolve(ResolveArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,6 +95,16 @@ struct ConfigCheckArgs {
     config: ConfigOverrides,
 }
 
+#[derive(Debug, Args, Clone)]
+struct ResolveArgs {
+    #[command(flatten)]
+    config: ConfigOverrides,
+
+    /// Minimum age in days before a pending decision is scored.
+    #[arg(long, value_name = "DAYS", default_value_t = 14)]
+    horizon_days: i64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct RunRequest {
     tickers: Vec<String>,
@@ -124,8 +136,75 @@ async fn main() -> Result<()> {
             print_providers();
             Ok(())
         }
+        Some(Command::Resolve(args)) => run_resolve(args).await,
         None => run_analysis(cli.run).await,
     }
+}
+
+async fn run_resolve(args: ResolveArgs) -> Result<()> {
+    use trading_agent_rs::data::yfinance::YahooFinanceClient;
+    use trading_agent_rs::memory::DecisionLog;
+    use trading_agent_rs::resolve::{record_lessons, resolve_pending};
+
+    apply_config_overrides(&args.config)?;
+    if args.horizon_days < 1 {
+        anyhow::bail!("--horizon-days must be at least 1");
+    }
+
+    // The LLM writes the reflection but isn't required — resolution falls
+    // back to a mechanical reflection when no provider is configured.
+    let llm = match AppConfig::from_env() {
+        Ok(cfg) => AnyLLMClient::new(
+            cfg.llm.provider.as_str(),
+            &cfg.llm.quick_model,
+            &cfg.llm.api_key,
+            &cfg.llm.base_url,
+        )
+        .ok(),
+        Err(e) => {
+            tracing::warn!("LLM unavailable ({}); using mechanical reflections", e);
+            None
+        }
+    };
+
+    let yf = YahooFinanceClient::new();
+    let log_path = DecisionLog::default_path();
+    let mut log = DecisionLog::load(&log_path, Some(100));
+    let pending_count = log.pending().len();
+
+    let resolutions = resolve_pending(
+        &mut log,
+        &yf,
+        llm.as_ref()
+            .map(|c| c as &dyn trading_agent_rs::llm::LLMClient),
+        args.horizon_days,
+    )
+    .await?;
+
+    if resolutions.is_empty() {
+        println!(
+            "No pending decisions old enough to resolve ({} pending, horizon: {} days).",
+            pending_count, args.horizon_days
+        );
+        return Ok(());
+    }
+
+    log.save()?;
+    record_lessons(&resolutions);
+
+    for r in &resolutions {
+        println!(
+            "{} {} {}: return {:+.1}%, alpha {:+.1}%",
+            r.ticker, r.date, r.rating, r.realized_return, r.alpha
+        );
+        println!("  {}", r.reflection);
+    }
+    println!(
+        "\nResolved {} of {} pending decision(s). Lessons recorded to agent memories.",
+        resolutions.len(),
+        pending_count
+    );
+    Ok(())
 }
 
 async fn run_analysis(args: RunArgs) -> Result<()> {
@@ -514,6 +593,22 @@ mod tests {
                 "2026-04-30".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn clap_accepts_resolve_subcommand() {
+        let cli =
+            Cli::try_parse_from(["trading-agent-rs", "resolve", "--horizon-days", "21"]).unwrap();
+        match cli.command {
+            Some(Command::Resolve(args)) => assert_eq!(args.horizon_days, 21),
+            _ => panic!("expected resolve command"),
+        }
+
+        let cli = Cli::try_parse_from(["trading-agent-rs", "resolve"]).unwrap();
+        match cli.command {
+            Some(Command::Resolve(args)) => assert_eq!(args.horizon_days, 14),
+            _ => panic!("expected resolve command"),
+        }
     }
 
     #[test]

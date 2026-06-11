@@ -269,6 +269,17 @@ impl YahooFinanceClient {
         Ok(quotes)
     }
 
+    /// Fetch parsed OHLCV quotes for a date range (used by decision resolution).
+    pub async fn get_quotes(
+        &self,
+        symbol: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<Vec<Quote>> {
+        let json = self.fetch_chart(symbol, start_date, end_date).await?;
+        Self::parse_chart_quotes(&json, symbol)
+    }
+
     /// Fetch stock data for a date range
     pub async fn get_stock_data(
         &self,
