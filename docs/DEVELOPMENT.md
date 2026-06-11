@@ -37,6 +37,6 @@ Prefer tests that use mock JSON responses and local parsing helpers over tests t
 
 Live Yahoo Finance coverage belongs behind ignored smoke tests because endpoints and market data can change.
 
-## Root helper scripts
+## Helper scripts
 
-The root PowerShell, batch, and linker-wrapper files are Windows development helpers. Treat them as local build-environment support, not release artifacts. If a helper becomes required for normal development, document the exact command in this file or move the helper under a dedicated `dev\` directory with its own README.
+The PowerShell, batch, and linker-wrapper files under `scripts\` are Windows development helpers (AppLocker/Defender exclusions, MSVC environment wrappers). Treat them as local build-environment support, not release artifacts.

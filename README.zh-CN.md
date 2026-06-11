@@ -110,6 +110,12 @@ cargo run -- analyze AAPL MSFT NVDA --date 2026-04-30 --concurrency 2
 cargo run -- AAPL MSFT NVDA 2026-04-30
 ```
 
+对过往决策按实际收益打分，并把经验教训写入 Agent 记忆（未到期的决策保持 pending）：
+
+```powershell
+cargo run -- resolve --horizon-days 14
+```
+
 生成的报告会写入 `reports\<TICKER>_<DATE>.md`，除非通过 `--reports-dir` 或 `TRADING_AGENT_REPORTS_DIR` 指定其他目录。
 
 ## 配置
@@ -125,6 +131,10 @@ trading-agent-rs 会自动加载 `.env`。通用 `TRADING_AGENT_*` 变量会覆�
 | `TRADING_AGENT_QUICK_MODEL` | `--quick-model` | 分析师和工具密集型调用使用的模型 | `TRADING_AGENT_MODEL` |
 | `TRADING_AGENT_DEEP_MODEL` | `--deep-model` | 综合分析调用使用的模型 | `TRADING_AGENT_MODEL` |
 | `TRADING_AGENT_BATCH_CONCURRENCY` | `--concurrency` | 批处理模式下并发分析的股票数量 | `1` |
+| `TRADING_AGENT_LLM_CONCURRENCY` | 未设置 | 进程级 LLM 并发请求上限（rate limit 保护） | `4` |
+| `TRADING_AGENT_LLM_TIMEOUT` | 未设置 | LLM 请求超时（秒） | `240` |
+| `TRADING_AGENT_MAX_TOKENS` | 未设置 | Anthropic 格式响应的最大输出 token 数；被截断时会记录警告 | `4096` |
+| `TRADING_AGENT_QUICK_THINKING` | 未设置 | 设为 `off` 可关闭 quick 模型（辩论/风险）调用的扩展思考 | `on` |
 | `TRADING_AGENT_REPORTS_DIR` | `--reports-dir` | 生成 Markdown 报告的目录 | `reports` |
 | `TRADING_AGENT_YAHOO_BASE_URL` | 未设置 | 可选 Yahoo Finance Base URL 覆盖项 | `https://query1.finance.yahoo.com` |
 
@@ -137,7 +147,7 @@ Provider 专用变量：
 | OpenAI | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `gpt-4o` |
 | Anthropic | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | `claude-sonnet-4-6` |
 
-如果 provider 对 rate limit 敏感，请保持 `TRADING_AGENT_BATCH_CONCURRENCY=1`，或传入 `--concurrency 1`。
+无论批处理并发设多大，`TRADING_AGENT_LLM_CONCURRENCY` 都会限制同时在途的 LLM 请求数，因此对大多数 provider 来说 `--concurrency 4` 是安全的。如果 provider 仍然返回 429，把 `TRADING_AGENT_LLM_CONCURRENCY` 降到 2-3。
 
 ## 输出示例
 
@@ -177,7 +187,7 @@ trading-agent-rs 有意从比上游 Python 项目更小的范围开始。当前�
 | Docker | 尚未打包 | 添加 `Dockerfile` 和 compose 示例 |
 | 本地模型 | 尚未接入 Ollama | 添加 Ollama/OpenAI-compatible 本地配置 |
 | Provider 覆盖 | MiniMax、Z.ai、OpenAI-compatible、Anthropic-compatible | 考虑 Gemini、DeepSeek、Qwen、OpenRouter、Azure 和 Bedrock |
-| 持久化 | 已有 BM25 memory 工具，但运行时持久化尚未启用 | 接入持久化决策记忆，并文档化存储路径 |
+| 持久化 | 决策日志和 BM25 Agent 记忆持久化在 `~/.trading-agent-rs/` 下；`resolve` 子命令对过往决策打分并记录经验 | 对已结算决策做更丰富的结果分析 |
 | 断点续跑 | 尚未实现 | 为中断的长任务添加可恢复图执行 |
 | Benchmark | 已记录性能目标，但未发布 benchmark 结果 | 添加可复现的多股票 benchmark 脚本和结果 |
 

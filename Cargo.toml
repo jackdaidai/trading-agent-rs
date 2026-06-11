@@ -1,9 +1,12 @@
 [package]
 name = "trading-agent-rs"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
+description = "Rust-native AI stock analysis agent: multi-agent analyst/debate/trader/risk pipeline producing Markdown research reports"
+repository = "https://github.com/jackdaidai/trading-agent-rs"
+readme = "README.md"
 
 [dependencies]
 # Async runtime

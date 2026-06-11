@@ -110,6 +110,12 @@ Legacy positional date syntax is still supported:
 cargo run -- AAPL MSFT NVDA 2026-04-30
 ```
 
+Score past decisions against realized returns and record the lessons into agent memories (decisions younger than the horizon stay pending):
+
+```powershell
+cargo run -- resolve --horizon-days 14
+```
+
 Generated reports are written to `reports\<TICKER>_<DATE>.md` unless `--reports-dir` or `TRADING_AGENT_REPORTS_DIR` overrides the directory.
 
 ## Configuration
@@ -125,6 +131,10 @@ trading-agent-rs loads `.env` automatically. Generic `TRADING_AGENT_*` variables
 | `TRADING_AGENT_QUICK_MODEL` | `--quick-model` | Model for analyst/tool-heavy calls | `TRADING_AGENT_MODEL` |
 | `TRADING_AGENT_DEEP_MODEL` | `--deep-model` | Model for synthesis calls | `TRADING_AGENT_MODEL` |
 | `TRADING_AGENT_BATCH_CONCURRENCY` | `--concurrency` | Number of ticker analyses to run concurrently in batch mode | `1` |
+| `TRADING_AGENT_LLM_CONCURRENCY` | unset | Process-wide cap on concurrent in-flight LLM requests (rate-limit guard) | `4` |
+| `TRADING_AGENT_LLM_TIMEOUT` | unset | LLM request timeout in seconds | `240` |
+| `TRADING_AGENT_MAX_TOKENS` | unset | Max output tokens for Anthropic-format responses; truncation logs a warning | `4096` |
+| `TRADING_AGENT_QUICK_THINKING` | unset | Set to `off` to disable extended thinking on quick-model (debate/risk) calls | `on` |
 | `TRADING_AGENT_REPORTS_DIR` | `--reports-dir` | Directory for generated Markdown reports | `reports` |
 | `TRADING_AGENT_YAHOO_BASE_URL` | unset | Optional Yahoo Finance base URL override | `https://query1.finance.yahoo.com` |
 
@@ -137,7 +147,7 @@ Provider-specific variables:
 | OpenAI | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `gpt-4o` |
 | Anthropic | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | `claude-sonnet-4-6` |
 
-For rate-limit-sensitive providers, keep `TRADING_AGENT_BATCH_CONCURRENCY=1` or pass `--concurrency 1`.
+In-flight LLM requests are capped by `TRADING_AGENT_LLM_CONCURRENCY` regardless of batch concurrency, so `--concurrency 4` is safe for most providers. If a provider still returns 429s, lower `TRADING_AGENT_LLM_CONCURRENCY` to 2-3.
 
 ## Output example
 
@@ -177,7 +187,7 @@ trading-agent-rs intentionally starts smaller than the upstream Python project. 
 | Docker | Not packaged yet | Add `Dockerfile` and compose examples |
 | Local models | Not wired to Ollama yet | Add an Ollama/OpenAI-compatible local profile |
 | Provider coverage | MiniMax, Z.ai, OpenAI-compatible, Anthropic-compatible | Consider Gemini, DeepSeek, Qwen, OpenRouter, Azure, and Bedrock |
-| Persistence | BM25 memory utilities exist, but runtime persistence is not enabled | Wire persistent decision memory and document its storage path |
+| Persistence | Decision log and BM25 agent memories persist under `~/.trading-agent-rs/`; `resolve` scores past decisions and records lessons | Richer outcome analytics across resolved decisions |
 | Checkpoint resume | Not implemented | Add resumable graph execution for interrupted long runs |
 | Benchmarks | Performance goal is documented, but benchmark results are not published | Add repeatable multi-ticker benchmark scripts and results |
 
