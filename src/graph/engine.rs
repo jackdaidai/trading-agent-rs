@@ -9,6 +9,7 @@ use crate::llm::{AnthropicContentBlock, AnthropicMessage, LLMClient, Tool};
 use crate::memory::{BM25Memory, DecisionLog, MemoryMatch};
 use crate::tools::{ToolName, ToolRegistry};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -79,6 +80,10 @@ pub struct GraphEngine {
     bear_memory: RwLock<BM25Memory>,
     trader_memory: RwLock<BM25Memory>,
     decision_log: RwLock<DecisionLog>,
+    /// Per-process cache of tool results keyed by tool name + args.
+    /// Dedupes repeated fetches within a run (social + news analysts both pull
+    /// ticker news) and across batch tickers (global news is date-keyed only).
+    tool_cache: RwLock<HashMap<String, String>>,
 }
 
 impl GraphEngine {
@@ -108,7 +113,22 @@ impl GraphEngine {
                 &BM25Memory::default_path("trader"),
             )),
             decision_log: RwLock::new(decision_log),
+            tool_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Execute a tool through the per-process result cache. Errors are not cached.
+    async fn cached_tool(&self, tool: ToolName, args: &serde_json::Value) -> Result<String> {
+        // serde_json::Map is a BTreeMap by default, so `args` serializes with
+        // sorted keys — the cache key is deterministic.
+        let key = format!("{}:{}", tool.as_str(), args);
+        if let Some(hit) = self.tool_cache.read().await.get(&key) {
+            tracing::debug!("Tool cache hit: {}", key);
+            return Ok(hit.clone());
+        }
+        let result = yfinance::execute_tool(tool, args, &self.yfinance).await?;
+        self.tool_cache.write().await.insert(key, result.clone());
+        Ok(result)
     }
 
     /// Run the full analysis for a ticker
@@ -203,11 +223,20 @@ impl GraphEngine {
             .unwrap_or_else(|_| date.to_string());
 
         let benchmark = yfinance::benchmark_for_ticker(ticker);
-        let benchmark_instruction = if benchmark != ticker {
-            format!(
-                r#"Also fetch stock data for the benchmark "{benchmark}" over the same period to compare relative performance (alpha).
-            "#
-            )
+
+        // Prefetch the data the prompt prescribes — saves LLM tool round trips.
+        let stock_args =
+            serde_json::json!({"symbol": ticker, "start_date": start, "end_date": end});
+        let indicator_args = serde_json::json!({"symbol": ticker, "curr_date": end});
+        let (stock_data, indicators) = tokio::join!(
+            self.cached_tool(ToolName::GetStockData, &stock_args),
+            self.cached_tool(ToolName::GetIndicators, &indicator_args),
+        );
+        let benchmark_block = if benchmark != ticker {
+            let bm_args =
+                serde_json::json!({"symbol": benchmark, "start_date": start, "end_date": end});
+            let bm_data = self.cached_tool(ToolName::GetStockData, &bm_args).await;
+            prefetched_block(&format!("Benchmark {benchmark} stock data"), &bm_data)
         } else {
             String::new()
         };
@@ -216,9 +245,12 @@ impl GraphEngine {
             r#"You are a market analyst. Analyze the stock data for {ticker} on {date}.
             Regional benchmark for alpha comparison: {benchmark}
 
-            Use the get_stock_data tool with start_date="{start}" and end_date="{end}" to get recent OHLCV data.
-            Use the get_indicators tool with curr_date="{end}" to get RSI, MACD, Bollinger Bands.
-            {benchmark_instruction}
+            Pre-fetched data:
+            {stock_block}
+            {indicators_block}
+            {benchmark_block}
+
+            Tools are available if you need additional data (e.g., a different date window).
 
             Provide a concise market analysis covering:
             - Current price trend
@@ -227,7 +259,9 @@ impl GraphEngine {
             - Support/resistance levels if apparent
             - Relative performance vs {benchmark} (alpha)
 
-            End with: FINAL MARKET ANALYSIS: **SUMMARY**"#
+            End with: FINAL MARKET ANALYSIS: **SUMMARY**"#,
+            stock_block = prefetched_block(&format!("{ticker} stock data"), &stock_data),
+            indicators_block = prefetched_block("Technical indicators", &indicators),
         );
 
         let tools = vec![
@@ -239,12 +273,20 @@ impl GraphEngine {
     }
 
     async fn run_social_analyst(&self, ticker: &str, date: &str) -> Result<String> {
+        let (news_start, news_end) = news_window(date);
+        let news_args =
+            serde_json::json!({"ticker": ticker, "start_date": news_start, "end_date": news_end});
+        let news = self.cached_tool(ToolName::GetNews, &news_args).await;
+
         let prompt = format!(
             r#"You are a social media sentiment analyst. Analyze sentiment for {ticker} on {date}.
 
             {evidence_discipline}
 
-            Use the get_news tool with a recent lookback ending on {date} to get recent news and social sentiment around the stock.
+            Pre-fetched data:
+            {news_block}
+
+            Tools are available if you need additional data.
 
             Provide a concise sentiment analysis covering:
             - Overall investor sentiment (bullish/bearish/neutral)
@@ -253,7 +295,8 @@ impl GraphEngine {
             - Social media trends if apparent
 
             End with: FINAL SENTIMENT ANALYSIS: **POSITIVE/NEGATIVE/NEUTRAL**"#,
-            evidence_discipline = EVIDENCE_DISCIPLINE
+            evidence_discipline = EVIDENCE_DISCIPLINE,
+            news_block = prefetched_block("Recent news and sentiment", &news),
         );
 
         let tools = vec![self.tool_registry.get_by_name(ToolName::GetNews)];
@@ -262,6 +305,15 @@ impl GraphEngine {
     }
 
     async fn run_news_analyst(&self, ticker: &str, date: &str) -> Result<String> {
+        let (news_start, news_end) = news_window(date);
+        let news_args =
+            serde_json::json!({"ticker": ticker, "start_date": news_start, "end_date": news_end});
+        let global_args = serde_json::json!({"curr_date": date});
+        let (news, global_news) = tokio::join!(
+            self.cached_tool(ToolName::GetNews, &news_args),
+            self.cached_tool(ToolName::GetGlobalNews, &global_args),
+        );
+
         let prompt = format!(
             r#"You are a news analyst. Analyze news impact for {ticker} on {date}.
 
@@ -269,7 +321,11 @@ impl GraphEngine {
 
             {decision_calibration}
 
-            Use the get_news tool with a recent lookback ending on {date} to get recent company coverage, and get_global_news for broader market context.
+            Pre-fetched data:
+            {news_block}
+            {global_news_block}
+
+            Tools are available if you need additional data.
 
             Provide a concise news analysis covering:
             - Key news items affecting the stock
@@ -281,6 +337,8 @@ impl GraphEngine {
             End with: FINAL NEWS ANALYSIS: **IMPACT SUMMARY**"#,
             evidence_discipline = EVIDENCE_DISCIPLINE,
             decision_calibration = DECISION_CALIBRATION,
+            news_block = prefetched_block(&format!("{ticker} news"), &news),
+            global_news_block = prefetched_block("Global market news", &global_news),
         );
 
         let tools = vec![
@@ -292,6 +350,11 @@ impl GraphEngine {
     }
 
     async fn run_fundamentals_analyst(&self, ticker: &str, date: &str) -> Result<String> {
+        let financial_args = serde_json::json!({"ticker": ticker});
+        let financials = self
+            .cached_tool(ToolName::GetFinancials, &financial_args)
+            .await;
+
         let prompt = format!(
             r#"You are a fundamentals analyst. Analyze fundamental data for {ticker} on {date}.
 
@@ -299,7 +362,10 @@ impl GraphEngine {
 
             {decision_calibration}
 
-            Use the get_financials tool to gather the available company overview data (price, 52-week range, sector, industry). Detailed financial statements are not available natively; treat metrics that are not returned as not observed.
+            Pre-fetched data:
+            {financials_block}
+
+            Detailed financial statements are not available natively; treat metrics that are not returned as not observed. Tools are available if you need additional data.
 
             Provide a concise fundamentals analysis covering:
             - Business model and competitive position
@@ -311,6 +377,7 @@ impl GraphEngine {
             End with: FINAL FUNDAMENTALS ANALYSIS: **STRONG/WEAK/FAIR**"#,
             evidence_discipline = EVIDENCE_DISCIPLINE,
             decision_calibration = DECISION_CALIBRATION,
+            financials_block = prefetched_block("Company overview", &financials),
         );
 
         let tools = vec![self.tool_registry.get_by_name(ToolName::GetFinancials)];
@@ -842,14 +909,17 @@ impl GraphEngine {
             // Execute each tool and add tool_result messages (one per tool call)
             for (tc, tool_use_id) in tool_calls.iter().zip(tool_use_ids.iter()) {
                 tracing::info!("Round {}: executing tool {}", round + 1, tc.name);
-                let result_content =
-                    match yfinance::execute_tool(&tc.name, &tc.arguments, &self.yfinance).await {
-                        Ok(result) => result,
-                        Err(e) => {
-                            tracing::warn!("Tool {} failed: {}", tc.name, e);
-                            format!("error: {}", e)
-                        }
-                    };
+                let executed = match tc.name.parse::<ToolName>() {
+                    Ok(tool) => self.cached_tool(tool, &tc.arguments).await,
+                    Err(e) => Err(e),
+                };
+                let result_content = match executed {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::warn!("Tool {} failed: {}", tc.name, e);
+                        format!("error: {}", e)
+                    }
+                };
                 messages.push(AnthropicMessage {
                     role: "user".to_string(),
                     content: vec![AnthropicContentBlock::ToolResult {
@@ -871,6 +941,30 @@ impl GraphEngine {
         let final_response = self.llm_quick.complete_messages(messages, tools).await?;
         Ok(final_response.content)
     }
+}
+
+/// Format a prefetched tool result for prompt inclusion, degrading to a
+/// tool-usage hint if the fetch failed.
+fn prefetched_block(label: &str, result: &Result<String>) -> String {
+    match result {
+        Ok(text) => format!("### {label}\n{text}"),
+        Err(e) => {
+            format!("### {label}\nNot available ({e}). Use the tools to fetch it if needed.")
+        }
+    }
+}
+
+/// 14-day news lookback window ending on `date`. Shared by the social and
+/// news analysts so their prefetches hit the same tool-cache entry.
+fn news_window(date: &str) -> (String, String) {
+    let start = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|d| {
+            (d - chrono::Duration::days(14))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|_| date.to_string());
+    (start, date.to_string())
 }
 
 fn format_memory_matches(memories: &[MemoryMatch]) -> String {
@@ -935,4 +1029,65 @@ fn extract_rating_and_confidence(text: &str) -> (String, String) {
         .unwrap_or_else(|| "Unknown".to_string());
 
     (rating, confidence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::LLMResponse;
+
+    struct MockLLM;
+
+    #[async_trait::async_trait]
+    impl LLMClient for MockLLM {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn complete_with_tools(&self, _prompt: &str, _tools: &[Tool]) -> Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: String::new(),
+                tool_calls: None,
+                reasoning: None,
+            })
+        }
+
+        async fn complete_messages(
+            &self,
+            _messages: Vec<AnthropicMessage>,
+            _tools: &[Tool],
+        ) -> Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: String::new(),
+                tool_calls: None,
+                reasoning: None,
+            })
+        }
+
+        fn validate_model(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_tool_returns_cached_value_without_fetching() {
+        let engine = GraphEngine::new(GraphConfig::default(), Arc::new(MockLLM), Arc::new(MockLLM));
+        let args = serde_json::json!({"ticker": "AAPL"});
+        let key = format!("{}:{}", ToolName::GetFinancials.as_str(), args);
+        engine
+            .tool_cache
+            .write()
+            .await
+            .insert(key, "cached result".to_string());
+
+        let out = engine
+            .cached_tool(ToolName::GetFinancials, &args)
+            .await
+            .unwrap();
+        assert_eq!(out, "cached result");
+    }
 }

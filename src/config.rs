@@ -91,6 +91,17 @@ pub struct LlmConfig {
     pub base_url: String,
     pub quick_model: String,
     pub deep_model: String,
+    /// Whether quick-model calls may use extended thinking (default true).
+    /// Set TRADING_AGENT_QUICK_THINKING=off to disable for faster debate/risk calls.
+    pub quick_thinking: bool,
+}
+
+/// Parse a thinking toggle env value: "off"/"false"/"0"/"disabled"/"no" => false.
+fn thinking_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_lowercase().as_str(),
+        "off" | "false" | "0" | "disabled" | "no"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +136,9 @@ impl AppConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("reports"));
         let batch_concurrency = batch_concurrency_from_env()?;
+        let quick_thinking = env_var("TRADING_AGENT_QUICK_THINKING", "TAGENT_QUICK_THINKING")
+            .map(|v| thinking_enabled(&v))
+            .unwrap_or(true);
 
         if api_key.trim().is_empty() {
             bail!(
@@ -154,6 +168,7 @@ impl AppConfig {
                 base_url,
                 quick_model,
                 deep_model,
+                quick_thinking,
             },
             reports_dir,
             batch_concurrency,
@@ -182,7 +197,18 @@ fn batch_concurrency_from_env() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::Provider;
+    use super::{thinking_enabled, Provider};
+
+    #[test]
+    fn thinking_enabled_parses_toggle_values() {
+        assert!(!thinking_enabled("off"));
+        assert!(!thinking_enabled("FALSE"));
+        assert!(!thinking_enabled(" 0 "));
+        assert!(!thinking_enabled("disabled"));
+        assert!(thinking_enabled("on"));
+        assert!(thinking_enabled("true"));
+        assert!(thinking_enabled("anything-else"));
+    }
 
     #[test]
     fn provider_from_str_accepts_supported_values_case_insensitively() {

@@ -139,12 +139,15 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
         app_config.llm.deep_model
     );
 
-    let llm_quick = Arc::new(AnyLLMClient::new(
-        app_config.llm.provider.as_str(),
-        &app_config.llm.quick_model,
-        &app_config.llm.api_key,
-        &app_config.llm.base_url,
-    )?);
+    let llm_quick = Arc::new(
+        AnyLLMClient::new(
+            app_config.llm.provider.as_str(),
+            &app_config.llm.quick_model,
+            &app_config.llm.api_key,
+            &app_config.llm.base_url,
+        )?
+        .with_thinking_disabled(!app_config.llm.quick_thinking),
+    );
 
     let llm_deep = Arc::new(AnyLLMClient::new(
         app_config.llm.provider.as_str(),

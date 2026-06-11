@@ -71,6 +71,35 @@ impl From<AnthropicContentBlock> for Value {
 
 const MAX_RETRIES: u32 = 3;
 const BASE_DELAY_MS: u64 = 1000;
+const MAX_RETRY_AFTER_MS: u64 = 60_000;
+const DEFAULT_LLM_CONCURRENCY: usize = 4;
+
+/// Process-wide cap on concurrent in-flight LLM requests. Keeps batch runs
+/// under provider rate limits regardless of how many tickers run in parallel.
+/// Configurable via TRADING_AGENT_LLM_CONCURRENCY (legacy TAGENT_LLM_CONCURRENCY).
+static LLM_CONCURRENCY_LIMIT: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| {
+        let permits = std::env::var("TRADING_AGENT_LLM_CONCURRENCY")
+            .or_else(|_| std::env::var("TAGENT_LLM_CONCURRENCY"))
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_LLM_CONCURRENCY);
+        tokio::sync::Semaphore::new(permits)
+    });
+
+/// Parse a Retry-After header value (seconds form only) into milliseconds,
+/// capped at MAX_RETRY_AFTER_MS.
+fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| (secs * 1000).min(MAX_RETRY_AFTER_MS))
+}
 
 fn endpoint_url(base_url: &str, path: &str) -> String {
     let base = base_url.trim_end_matches('/');
@@ -94,11 +123,18 @@ async fn retry_request(
     >,
 ) -> Result<Value> {
     for attempt in 0..=MAX_RETRIES {
+        // Hold a concurrency permit only while the request is in flight,
+        // not during backoff sleeps.
+        let permit = LLM_CONCURRENCY_LIMIT
+            .acquire()
+            .await
+            .expect("LLM concurrency semaphore closed");
         let resp = build_request().await;
 
         let resp = match resp {
             Ok(r) => r,
             Err(e) if attempt < MAX_RETRIES => {
+                drop(permit);
                 let delay = BASE_DELAY_MS * 2u64.pow(attempt);
                 tracing::warn!(
                     "Request error (attempt {}): {}. Retrying in {}ms",
@@ -115,7 +151,10 @@ async fn retry_request(
         let status = resp.status();
         if status == 429 || status.is_server_error() {
             if attempt < MAX_RETRIES {
-                let delay = BASE_DELAY_MS * 2u64.pow(attempt);
+                // Prefer the provider's Retry-After hint over exponential backoff
+                let delay =
+                    retry_after_ms(resp.headers()).unwrap_or(BASE_DELAY_MS * 2u64.pow(attempt));
+                drop(permit);
                 tracing::warn!(
                     "HTTP {} (attempt {}). Retrying in {}ms",
                     status,
@@ -457,6 +496,9 @@ pub struct AnthropicClient {
     pub base_url: String,
     client: reqwest::Client,
     capabilities: ProviderCapabilities,
+    /// When true, send `thinking: disabled` on every call, not just tool calls.
+    /// Speeds up reasoning models (MiniMax M2, GLM) on short debate/risk prompts.
+    disable_thinking: bool,
 }
 
 impl AnthropicClient {
@@ -471,6 +513,7 @@ impl AnthropicClient {
                 .build()
                 .context("Failed to build Anthropic HTTP client")?,
             capabilities,
+            disable_thinking: false,
         })
     }
 }
@@ -501,12 +544,14 @@ impl LLMClient for AnthropicClient {
                     })
                 })
                 .collect::<Vec<_>>());
-            body["thinking"] = json!({"type": "disabled"});
 
             // Anthropic supports tool_choice; MiniMax (via Anthropic-compat) may not.
             if self.capabilities.supports_tool_choice {
                 body["tool_choice"] = json!({"type": "auto"});
             }
+        }
+        if !tools.is_empty() || self.disable_thinking {
+            body["thinking"] = json!({"type": "disabled"});
         }
 
         let resp_json = retry_request(|| {
@@ -564,11 +609,13 @@ impl LLMClient for AnthropicClient {
                     })
                 })
                 .collect::<Vec<_>>());
-            body["thinking"] = json!({"type": "disabled"});
 
             if self.capabilities.supports_tool_choice {
                 body["tool_choice"] = json!({"type": "auto"});
             }
+        }
+        if !tools.is_empty() || self.disable_thinking {
+            body["thinking"] = json!({"type": "disabled"});
         }
 
         let resp_json = retry_request(|| {
@@ -621,6 +668,18 @@ impl AnyLLMClient {
         };
         Ok(client)
     }
+
+    /// Disable extended thinking on all calls (Anthropic-format providers only;
+    /// no-op for OpenAI-format providers, which have no thinking parameter).
+    pub fn with_thinking_disabled(self, disabled: bool) -> Self {
+        match self {
+            Self::Anthropic(mut c) => {
+                c.disable_thinking = disabled;
+                Self::Anthropic(c)
+            }
+            other => other,
+        }
+    }
 }
 
 #[async_trait]
@@ -668,9 +727,29 @@ impl LLMClient for AnyLLMClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        endpoint_url, parse_anthropic_response, parse_openai_response, ProviderCapabilities,
+        endpoint_url, parse_anthropic_response, parse_openai_response, retry_after_ms,
+        ProviderCapabilities,
     };
     use serde_json::json;
+
+    #[test]
+    fn retry_after_header_parsed_in_seconds_and_capped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_ms(&headers), None);
+
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(retry_after_ms(&headers), Some(7_000));
+
+        headers.insert(reqwest::header::RETRY_AFTER, "999".parse().unwrap());
+        assert_eq!(retry_after_ms(&headers), Some(60_000));
+
+        // HTTP-date form is not supported — fall back to exponential backoff
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after_ms(&headers), None);
+    }
 
     #[test]
     fn capability_table_supports_tool_choice_for_standard_providers() {

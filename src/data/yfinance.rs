@@ -12,6 +12,7 @@ use std::time::Duration;
 const NEWS_ARTICLE_LIMIT: usize = 20;
 const NEWS_EXCERPT_LIMIT: usize = 8;
 const NEWS_EXCERPT_CHARS: usize = 900;
+const ARTICLE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const YAHOO_USER_AGENT: &str = "Mozilla/5.0";
 
 // =============================================================================
@@ -443,6 +444,28 @@ impl YahooFinanceClient {
             return Ok(output);
         }
 
+        // Fetch article excerpts in parallel — serial fetches at up to
+        // ARTICLE_FETCH_TIMEOUT each dominated get_news latency.
+        let mut excerpt_handles = Vec::new();
+        for (i, article) in articles.iter().enumerate().take(NEWS_EXCERPT_LIMIT) {
+            let Some(link) = article.get("link").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let client = self.clone();
+            let link = link.to_string();
+            let ticker = ticker.to_string();
+            excerpt_handles.push((
+                i,
+                tokio::spawn(async move { client.fetch_article_excerpt(&link, &ticker).await }),
+            ));
+        }
+        let mut excerpts = std::collections::HashMap::new();
+        for (i, handle) in excerpt_handles {
+            if let Ok(Some(excerpt)) = handle.await {
+                excerpts.insert(i, excerpt);
+            }
+        }
+
         for (i, article) in articles.iter().enumerate().take(NEWS_ARTICLE_LIMIT) {
             let title = article
                 .get("title")
@@ -473,10 +496,8 @@ impl YahooFinanceClient {
             if let Some(summary) = summary {
                 output += &format!("Summary: {}\n", summary);
             }
-            if i < NEWS_EXCERPT_LIMIT {
-                if let Some(excerpt) = self.fetch_article_excerpt(link, ticker).await {
-                    output += &format!("Article excerpt: {}\n", excerpt);
-                }
+            if let Some(excerpt) = excerpts.get(&i) {
+                output += &format!("Article excerpt: {}\n", excerpt);
             }
             output += "\n";
         }
@@ -492,6 +513,7 @@ impl YahooFinanceClient {
         let response = self
             .client
             .get(link)
+            .timeout(ARTICLE_FETCH_TIMEOUT)
             .send()
             .await
             .ok()?
@@ -865,13 +887,11 @@ pub fn validate_ticker(ticker: &str) -> Result<()> {
 }
 
 pub async fn execute_tool(
-    tool_name: &str,
+    tool: crate::tools::ToolName,
     args: &serde_json::Value,
     client: &YahooFinanceClient,
 ) -> Result<String> {
     use crate::tools::ToolName;
-
-    let tool = tool_name.parse::<ToolName>()?;
 
     match tool {
         ToolName::GetStockData => {
