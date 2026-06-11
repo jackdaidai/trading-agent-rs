@@ -73,6 +73,36 @@ const MAX_RETRIES: u32 = 3;
 const BASE_DELAY_MS: u64 = 1000;
 const MAX_RETRY_AFTER_MS: u64 = 60_000;
 const DEFAULT_LLM_CONCURRENCY: usize = 4;
+const DEFAULT_LLM_TIMEOUT_SECS: u64 = 240;
+const DEFAULT_MAX_TOKENS: u64 = 4096;
+
+fn env_u64(primary: &str, legacy: &str, default: u64) -> u64 {
+    std::env::var(primary)
+        .or_else(|_| std::env::var(legacy))
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// HTTP timeout for LLM requests. Deep-synthesis calls on reasoning models
+/// can legitimately run for minutes; a timeout that's too short re-runs the
+/// whole expensive call on each retry and then fails the ticker.
+fn llm_timeout() -> Duration {
+    Duration::from_secs(env_u64(
+        "TRADING_AGENT_LLM_TIMEOUT",
+        "TAGENT_LLM_TIMEOUT",
+        DEFAULT_LLM_TIMEOUT_SECS,
+    ))
+}
+
+fn llm_max_tokens() -> u64 {
+    env_u64(
+        "TRADING_AGENT_MAX_TOKENS",
+        "TAGENT_MAX_TOKENS",
+        DEFAULT_MAX_TOKENS,
+    )
+}
 
 /// Process-wide cap on concurrent in-flight LLM requests. Keeps batch runs
 /// under provider rate limits regardless of how many tickers run in parallel.
@@ -201,6 +231,16 @@ fn parse_openai_response(resp_json: &Value) -> Result<LLMResponse> {
         }
     };
 
+    if resp_json
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        == Some("length")
+    {
+        tracing::warn!(
+            "OpenAI response truncated at the model's token limit — output may be cut off mid-sentence"
+        );
+    }
+
     Ok(LLMResponse {
         content,
         tool_calls,
@@ -226,6 +266,12 @@ fn parse_openai_tool_call(value: &Value) -> Result<ToolCall> {
 }
 
 fn parse_anthropic_response(resp_json: &Value) -> Result<LLMResponse> {
+    if resp_json.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+        tracing::warn!(
+            "Response truncated at max_tokens — consider raising TRADING_AGENT_MAX_TOKENS"
+        );
+    }
+
     let blocks = resp_json
         .get("content")
         .and_then(Value::as_array)
@@ -386,7 +432,7 @@ impl OpenAIClient {
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(120))
+                .timeout(llm_timeout())
                 .build()
                 .context("Failed to build OpenAI HTTP client")?,
             capabilities,
@@ -499,6 +545,7 @@ pub struct AnthropicClient {
     /// When true, send `thinking: disabled` on every call, not just tool calls.
     /// Speeds up reasoning models (MiniMax M2, GLM) on short debate/risk prompts.
     disable_thinking: bool,
+    max_tokens: u64,
 }
 
 impl AnthropicClient {
@@ -509,11 +556,12 @@ impl AnthropicClient {
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(120))
+                .timeout(llm_timeout())
                 .build()
                 .context("Failed to build Anthropic HTTP client")?,
             capabilities,
             disable_thinking: false,
+            max_tokens: llm_max_tokens(),
         })
     }
 }
@@ -529,7 +577,7 @@ impl LLMClient for AnthropicClient {
         let mut body = json!({
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         });
 
         // Add tool definitions if provided
@@ -595,7 +643,7 @@ impl LLMClient for AnthropicClient {
         let mut body = json!({
             "model": self.model,
             "messages": api_messages,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         });
 
         if !tools.is_empty() {
@@ -850,6 +898,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing content array"));
+    }
+
+    #[test]
+    fn parse_anthropic_response_survives_max_tokens_truncation() {
+        let response = json!({
+            "stop_reason": "max_tokens",
+            "content": [{"type": "text", "text": "truncated repor"}]
+        });
+
+        let parsed = parse_anthropic_response(&response).unwrap();
+        assert_eq!(parsed.content, "truncated repor");
     }
 
     #[test]

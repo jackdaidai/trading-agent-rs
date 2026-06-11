@@ -192,8 +192,10 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
         trading_agent_rs::data::yfinance::validate_ticker(t)?;
     }
 
-    // Validate all tickers in parallel
-    {
+    // Validate all tickers in parallel. Invalid tickers are skipped with a
+    // warning so one bad symbol doesn't abort a whole batch; the run still
+    // exits non-zero at the end if anything was skipped.
+    let (tickers, skipped) = {
         use trading_agent_rs::data::yfinance::YahooFinanceClient;
         let yf = YahooFinanceClient::new();
         let mut validates = Vec::new();
@@ -217,11 +219,31 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
                 }
             }));
         }
+        let mut valid = Vec::new();
+        let mut skipped = 0usize;
         for v in validates {
-            v.await??;
+            match v.await? {
+                Ok(t) => valid.push(t),
+                Err(e) => {
+                    tracing::warn!("Skipping ticker: {}", e);
+                    skipped += 1;
+                }
+            }
         }
-        tracing::info!("All tickers validated");
-    }
+        if valid.is_empty() {
+            anyhow::bail!("No valid tickers to analyze");
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "Proceeding with {} of {} tickers",
+                valid.len(),
+                valid.len() + skipped
+            );
+        } else {
+            tracing::info!("All tickers validated");
+        }
+        (valid, skipped)
+    };
 
     // Run analysis — single ticker directly, multiple in parallel
     std::fs::create_dir_all(&app_config.reports_dir)?;
@@ -281,6 +303,10 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
         if any_failed {
             anyhow::bail!("One or more analyses failed");
         }
+    }
+
+    if skipped > 0 {
+        anyhow::bail!("{} ticker(s) were skipped during validation", skipped);
     }
 
     Ok(())

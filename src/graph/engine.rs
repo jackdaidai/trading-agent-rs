@@ -203,11 +203,23 @@ impl GraphEngine {
             self.run_fundamentals_analyst(ticker, date),
         );
 
+        // One failed analyst degrades to an "unavailable" note so the other
+        // three still produce a decision; only abort when all four failed.
+        let all_failed =
+            market.is_err() && social.is_err() && news.is_err() && fundamentals.is_err();
+        if all_failed {
+            anyhow::bail!(
+                "All four analysts failed for {}; first error: {}",
+                ticker,
+                market.unwrap_err()
+            );
+        }
+
         Ok(AnalystResults {
-            market: market?,
-            social: social?,
-            news: news?,
-            fundamentals: fundamentals?,
+            market: report_or_unavailable("Market", market),
+            social: report_or_unavailable("Social sentiment", social),
+            news: report_or_unavailable("News", news),
+            fundamentals: report_or_unavailable("Fundamentals", fundamentals),
         })
     }
 
@@ -943,6 +955,18 @@ impl GraphEngine {
     }
 }
 
+/// Unwrap an analyst result, degrading a failure to an "unavailable" note so
+/// the pipeline can continue on the remaining analysts' evidence.
+fn report_or_unavailable(analyst: &str, result: Result<String>) -> String {
+    match result {
+        Ok(report) => report,
+        Err(e) => {
+            tracing::warn!("{} analyst failed: {}", analyst, e);
+            format!("{analyst} analyst report unavailable (error: {e})")
+        }
+    }
+}
+
 /// Format a prefetched tool result for prompt inclusion, degrading to a
 /// tool-usage hint if the fetch failed.
 fn prefetched_block(label: &str, result: &Result<String>) -> String {
@@ -1071,6 +1095,16 @@ mod tests {
         fn provider_name(&self) -> &str {
             "mock"
         }
+    }
+
+    #[test]
+    fn report_or_unavailable_degrades_failures_to_note() {
+        let ok = report_or_unavailable("Market", Ok("strong uptrend".to_string()));
+        assert_eq!(ok, "strong uptrend");
+
+        let err = report_or_unavailable("Market", Err(anyhow::anyhow!("HTTP 500")));
+        assert!(err.contains("Market analyst report unavailable"));
+        assert!(err.contains("HTTP 500"));
     }
 
     #[tokio::test]
