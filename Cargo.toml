@@ -13,7 +13,7 @@ readme = "README.md"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 # HTTP client for LLM APIs
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "cookies"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

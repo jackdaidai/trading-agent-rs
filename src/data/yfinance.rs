@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 
 const NEWS_ARTICLE_LIMIT: usize = 20;
@@ -104,6 +105,8 @@ pub struct TechnicalIndicators {
 pub struct YahooFinanceClient {
     client: reqwest::Client,
     base_url: String,
+    /// Cached Yahoo auth crumb for the quoteSummary endpoint (fetched once).
+    crumb: Arc<tokio::sync::OnceCell<String>>,
 }
 
 impl YahooFinanceClient {
@@ -112,11 +115,13 @@ impl YahooFinanceClient {
             client: reqwest::Client::builder()
                 .user_agent(YAHOO_USER_AGENT)
                 .timeout(Duration::from_secs(12))
+                .cookie_store(true)
                 .build()
                 .expect("Failed to build Yahoo Finance HTTP client"),
             base_url: std::env::var("TRADING_AGENT_YAHOO_BASE_URL")
                 .or_else(|_| std::env::var("TAGENT_YAHOO_BASE_URL"))
                 .unwrap_or_else(|_| "https://query1.finance.yahoo.com".to_string()),
+            crumb: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -125,9 +130,11 @@ impl YahooFinanceClient {
             client: reqwest::Client::builder()
                 .user_agent(YAHOO_USER_AGENT)
                 .timeout(Duration::from_secs(12))
+                .cookie_store(true)
                 .build()
                 .expect("Failed to build Yahoo Finance HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
+            crumb: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -351,8 +358,188 @@ impl YahooFinanceClient {
         Ok(output)
     }
 
-    /// Get company info / fundamentals
+    /// Fetch (once, cached) a Yahoo auth crumb. Warms the cookie jar first.
+    async fn get_crumb(&self) -> Result<String> {
+        self.crumb
+            .get_or_try_init(|| async {
+                // fc.yahoo.com sets the session cookie the crumb endpoint needs.
+                let _ = self.client.get("https://fc.yahoo.com").send().await;
+                let resp = self
+                    .client
+                    .get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+                    .header("accept", "text/plain")
+                    .send()
+                    .await
+                    .context("crumb request failed")?;
+                let crumb = resp.text().await.context("reading crumb")?;
+                let crumb = crumb.trim().to_string();
+                if crumb.is_empty() || crumb.contains('<') || crumb.len() > 64 {
+                    anyhow::bail!("invalid crumb response");
+                }
+                Ok::<String, anyhow::Error>(crumb)
+            })
+            .await
+            .map(|s| s.clone())
+    }
+
+    /// Valuation + financial fundamentals via the authenticated quoteSummary
+    /// endpoint (market cap, P/E, EPS, margins, revenue, cash flow).
+    async fn fundamentals_quote_summary(&self, ticker: &str) -> Result<String> {
+        fn raw(m: Option<&serde_json::Value>, key: &str) -> Option<f64> {
+            m?.get(key)?.get("raw")?.as_f64()
+        }
+        fn money(n: f64) -> String {
+            if n.abs() >= 1e9 {
+                format!("${:.2}B", n / 1e9)
+            } else if n.abs() >= 1e6 {
+                format!("${:.1}M", n / 1e6)
+            } else {
+                format!("${:.0}", n)
+            }
+        }
+
+        let crumb = self.get_crumb().await?;
+        let path = format!("/v10/finance/quoteSummary/{}", encode_component(ticker));
+        let modules = "assetProfile,price,summaryDetail,defaultKeyStatistics,financialData";
+        let response = self
+            .client
+            .get(self.endpoint(&path))
+            .query(&[("modules", modules), ("crumb", crumb.as_str())])
+            .send()
+            .await
+            .context("quoteSummary request failed")?;
+        let status = response.status();
+        let body = response.text().await.context("reading quoteSummary")?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "quoteSummary HTTP {}: {}",
+                status,
+                body.chars().take(160).collect::<String>()
+            );
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&body).context("parsing quoteSummary JSON")?;
+        let r = json
+            .pointer("/quoteSummary/result/0")
+            .context("quoteSummary missing result")?;
+
+        let profile = r.get("assetProfile");
+        let price = r.get("price");
+        let sd = r.get("summaryDetail");
+        let ks = r.get("defaultKeyStatistics");
+        let fd = r.get("financialData");
+
+        let mut out = format!("## {} Fundamentals\n\n", ticker);
+        if let Some(n) = price
+            .and_then(|p| p.get("longName").or_else(|| p.get("shortName")))
+            .and_then(|v| v.as_str())
+        {
+            out += &format!("**Company**: {}\n\n", n);
+        }
+        if let Some(s) = profile.and_then(|p| p.get("sector")).and_then(|v| v.as_str()) {
+            out += &format!("**Sector**: {}\n", s);
+        }
+        if let Some(i) = profile.and_then(|p| p.get("industry")).and_then(|v| v.as_str()) {
+            out += &format!("**Industry**: {}\n", i);
+        }
+
+        out += "\n### Valuation\n\n";
+        if let Some(v) = raw(fd, "currentPrice").or_else(|| raw(price, "regularMarketPrice")) {
+            out += &format!("- **Current Price**: ${:.2}\n", v);
+        }
+        if let Some(v) = raw(price, "marketCap").or_else(|| raw(sd, "marketCap")) {
+            out += &format!("- **Market Cap**: {}\n", money(v));
+        }
+        if let Some(v) = raw(sd, "trailingPE") {
+            out += &format!("- **Trailing P/E**: {:.2}\n", v);
+        }
+        if let Some(v) = raw(sd, "forwardPE").or_else(|| raw(ks, "forwardPE")) {
+            out += &format!("- **Forward P/E**: {:.2}\n", v);
+        }
+        if let Some(v) = raw(ks, "trailingEps") {
+            out += &format!("- **Trailing EPS**: ${:.2}\n", v);
+        }
+        if let Some(v) = raw(ks, "forwardEps") {
+            out += &format!("- **Forward EPS**: ${:.2}\n", v);
+        }
+        if let Some(v) = raw(ks, "priceToBook") {
+            out += &format!("- **P/B**: {:.2}\n", v);
+        }
+        if let Some(v) = raw(ks, "enterpriseValue") {
+            out += &format!("- **Enterprise Value**: {}\n", money(v));
+        }
+        if let Some(v) = raw(sd, "dividendYield") {
+            out += &format!("- **Dividend Yield**: {:.2}%\n", v * 100.0);
+        }
+
+        out += "\n### Financials (TTM)\n\n";
+        if let Some(v) = raw(fd, "totalRevenue") {
+            out += &format!("- **Revenue**: {}\n", money(v));
+        }
+        if let Some(v) = raw(fd, "revenueGrowth") {
+            out += &format!("- **Revenue Growth (YoY)**: {:.1}%\n", v * 100.0);
+        }
+        if let Some(v) = raw(fd, "grossMargins") {
+            out += &format!("- **Gross Margin**: {:.1}%\n", v * 100.0);
+        }
+        if let Some(v) = raw(fd, "operatingMargins") {
+            out += &format!("- **Operating Margin**: {:.1}%\n", v * 100.0);
+        }
+        if let Some(v) = raw(fd, "profitMargins").or_else(|| raw(ks, "profitMargins")) {
+            out += &format!("- **Profit Margin**: {:.1}%\n", v * 100.0);
+        }
+        if let Some(v) = raw(fd, "returnOnEquity") {
+            out += &format!("- **ROE**: {:.1}%\n", v * 100.0);
+        }
+        if let Some(v) = raw(fd, "freeCashflow") {
+            out += &format!("- **Free Cash Flow**: {}\n", money(v));
+        }
+        if let Some(v) = raw(fd, "totalCash") {
+            out += &format!("- **Total Cash**: {}\n", money(v));
+        }
+        if let Some(v) = raw(fd, "totalDebt") {
+            out += &format!("- **Total Debt**: {}\n", money(v));
+        }
+        if let Some(v) = raw(sd, "fiftyTwoWeekHigh") {
+            out += &format!("- **52W High**: {:.2}\n", v);
+        }
+        if let Some(v) = raw(sd, "fiftyTwoWeekLow") {
+            out += &format!("- **52W Low**: {:.2}\n", v);
+        }
+
+        if let Some(k) = fd
+            .and_then(|f| f.get("recommendationKey"))
+            .and_then(|v| v.as_str())
+        {
+            out += &format!("\n- **Analyst Reco**: {}\n", k);
+        }
+        if let Some(v) = raw(fd, "targetMeanPrice") {
+            out += &format!("- **Mean Target Price**: ${:.2}\n", v);
+        }
+
+        out += "\nSource: Yahoo Finance quoteSummary (authenticated).\n";
+        Ok(out)
+    }
+
+    /// Get company info / fundamentals. Prefers the authenticated quoteSummary
+    /// endpoint; falls back to the public chart/search endpoints if it fails.
     pub async fn get_fundamentals(&self, ticker: &str) -> Result<String> {
+        match self.fundamentals_quote_summary(ticker).await {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                tracing::warn!(
+                    "quoteSummary fundamentals unavailable for {} ({}); using chart/search fallback",
+                    ticker,
+                    e
+                );
+                self.fundamentals_basic(ticker).await
+            }
+        }
+    }
+
+    /// Fallback: company info from the public chart `meta` + search endpoints
+    /// (no valuation metrics; used when quoteSummary/crumb is unavailable).
+    async fn fundamentals_basic(&self, ticker: &str) -> Result<String> {
         let today = chrono::Utc::now().date_naive();
         let start = (today - chrono::Duration::days(7))
             .format("%Y-%m-%d")
