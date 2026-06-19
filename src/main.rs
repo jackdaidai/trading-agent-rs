@@ -249,8 +249,14 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
     );
 
     // Create graph engine
+    let output_language = std::env::var("TRADING_AGENT_OUTPUT_LANG")
+        .or_else(|_| std::env::var("TAGENT_OUTPUT_LANG"))
+        .unwrap_or_else(|_| "English".to_string());
     let engine = Arc::new(GraphEngine::new(
-        GraphConfig::default(),
+        GraphConfig {
+            output_language,
+            ..GraphConfig::default()
+        },
         llm_quick,
         llm_deep,
     ));

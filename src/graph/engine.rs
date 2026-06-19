@@ -185,6 +185,18 @@ impl GraphEngine {
         Ok(state)
     }
 
+    /// Append an output-language directive when a non-English language is
+    /// configured (via TRADING_AGENT_OUTPUT_LANG). No-op for English.
+    fn with_lang(&self, prompt: &str) -> String {
+        let lang = self.config.output_language.trim();
+        if lang.is_empty() || lang.eq_ignore_ascii_case("english") || lang.eq_ignore_ascii_case("en") {
+            return prompt.to_string();
+        }
+        format!(
+            "{prompt}\n\n=== OUTPUT LANGUAGE (MANDATORY) ===\nWrite your ENTIRE response in {lang}. Every heading, sentence, the Rating line, and all section titles MUST be in {lang}. Keep ticker symbols, numbers, prices, and currency symbols unchanged. Do not switch to English."
+        )
+    }
+
     // -------------------------------------------------------------------------
     // PHASE 1: Parallel Analysts
     // -------------------------------------------------------------------------
@@ -562,7 +574,7 @@ impl GraphEngine {
             decision_calibration = DECISION_CALIBRATION,
         );
 
-        self.llm_deep.complete(&prompt).await
+        self.llm_deep.complete(&self.with_lang(&prompt)).await
     }
 
     // -------------------------------------------------------------------------
@@ -613,7 +625,7 @@ impl GraphEngine {
             decision_calibration = DECISION_CALIBRATION,
         );
 
-        self.llm_quick.complete(&prompt).await
+        self.llm_quick.complete(&self.with_lang(&prompt)).await
     }
 
     // -------------------------------------------------------------------------
@@ -696,7 +708,7 @@ impl GraphEngine {
             decision_calibration = DECISION_CALIBRATION,
         );
 
-        self.llm_quick.complete(&prompt).await
+        self.llm_quick.complete(&self.with_lang(&prompt)).await
     }
 
     async fn run_conservative_risk(&self, state: &AgentState) -> Result<String> {
@@ -729,7 +741,7 @@ impl GraphEngine {
             decision_calibration = DECISION_CALIBRATION,
         );
 
-        self.llm_quick.complete(&prompt).await
+        self.llm_quick.complete(&self.with_lang(&prompt)).await
     }
 
     async fn run_neutral_risk(&self, state: &AgentState) -> Result<String> {
@@ -762,7 +774,7 @@ impl GraphEngine {
             decision_calibration = DECISION_CALIBRATION,
         );
 
-        self.llm_quick.complete(&prompt).await
+        self.llm_quick.complete(&self.with_lang(&prompt)).await
     }
 
     // -------------------------------------------------------------------------
@@ -821,7 +833,7 @@ impl GraphEngine {
             decision_calibration = DECISION_CALIBRATION,
         );
 
-        self.llm_deep.complete(&prompt).await
+        self.llm_deep.complete(&self.with_lang(&prompt)).await
     }
 
     // -------------------------------------------------------------------------
