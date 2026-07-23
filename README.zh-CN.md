@@ -1,6 +1,6 @@
 # trading-agent-rs
 
-[English](README.md) | **简体中文**
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 trading-agent-rs 是一个 Rust 原生的 AI 股票分析 Agent。它可以把一个或多个股票代码转换成 Markdown 研究报告，报告会综合市场数据、基本面、新闻、多 Agent 辩论和 LLM 综合分析。
 

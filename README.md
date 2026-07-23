@@ -1,6 +1,6 @@
 # trading-agent-rs
 
-**English** | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 trading-agent-rs is a Rust-native AI stock analysis agent that turns one or more tickers into Markdown research reports using market data, fundamentals, news, multi-agent debate, and LLM synthesis.
 
