@@ -406,7 +406,7 @@ impl YahooFinanceClient {
                 Ok::<String, anyhow::Error>(crumb)
             })
             .await
-            .map(|s| s.clone())
+            .cloned()
     }
 
     /// Valuation + financial fundamentals via the authenticated quoteSummary
@@ -463,10 +463,16 @@ impl YahooFinanceClient {
         {
             out += &format!("**Company**: {}\n\n", n);
         }
-        if let Some(s) = profile.and_then(|p| p.get("sector")).and_then(|v| v.as_str()) {
+        if let Some(s) = profile
+            .and_then(|p| p.get("sector"))
+            .and_then(|v| v.as_str())
+        {
             out += &format!("**Sector**: {}\n", s);
         }
-        if let Some(i) = profile.and_then(|p| p.get("industry")).and_then(|v| v.as_str()) {
+        if let Some(i) = profile
+            .and_then(|p| p.get("industry"))
+            .and_then(|v| v.as_str())
+        {
             out += &format!("**Industry**: {}\n", i);
         }
 

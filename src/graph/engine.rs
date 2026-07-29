@@ -189,7 +189,10 @@ impl GraphEngine {
     /// configured (via TRADING_AGENT_OUTPUT_LANG). No-op for English.
     fn with_lang(&self, prompt: &str) -> String {
         let lang = self.config.output_language.trim();
-        if lang.is_empty() || lang.eq_ignore_ascii_case("english") || lang.eq_ignore_ascii_case("en") {
+        if lang.is_empty()
+            || lang.eq_ignore_ascii_case("english")
+            || lang.eq_ignore_ascii_case("en")
+        {
             return prompt.to_string();
         }
         format!(
@@ -1066,8 +1069,10 @@ fn extract_rating_and_confidence(text: &str) -> (String, String) {
     });
     // Fallback for localized output: `最终评级：**买入**` etc.
     static RATING_ZH_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?:最终评级|最終評級)[:：]\s*\*{0,2}(买入|買入|增持|持有|减持|減持|卖出|賣出)\*{0,2}")
-            .unwrap()
+        Regex::new(
+            r"(?:最终评级|最終評級)[:：]\s*\*{0,2}(买入|買入|增持|持有|减持|減持|卖出|賣出)\*{0,2}",
+        )
+        .unwrap()
     });
     static CONFIDENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
         // Both orders: "confidence: High" and "with high confidence".

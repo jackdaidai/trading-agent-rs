@@ -402,9 +402,11 @@ impl DecisionLog {
         };
         for disk_entry in store.entries {
             let key = (disk_entry.ticker.to_lowercase(), disk_entry.date.clone());
-            match self.entries.iter_mut().find(|e| {
-                e.ticker.to_lowercase() == key.0 && e.date == key.1
-            }) {
+            match self
+                .entries
+                .iter_mut()
+                .find(|e| e.ticker.to_lowercase() == key.0 && e.date == key.1)
+            {
                 Some(mem_entry) => {
                     if mem_entry.status == DecisionStatus::Pending
                         && disk_entry.status == DecisionStatus::Resolved
