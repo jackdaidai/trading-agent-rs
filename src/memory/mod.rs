@@ -10,7 +10,35 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9]+\b").unwrap());
+static WORD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9]+\b|\p{Han}+").unwrap());
+
+/// Write `contents` to `path` atomically: write a temp file in the same
+/// directory, then rename over the target. Prevents a crash mid-write from
+/// leaving a truncated JSON file behind.
+fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Move an unparseable file out of the way instead of letting the next save
+/// overwrite it. Returns the backup path if the rename succeeded.
+fn backup_corrupt_file(path: &Path) -> Option<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let backup = path.with_extension(format!("json.corrupt-{ts}"));
+    match std::fs::rename(path, &backup) {
+        Ok(()) => Some(backup),
+        Err(e) => {
+            tracing::warn!("Failed to back up corrupt file {}: {}", path.display(), e);
+            None
+        }
+    }
+}
 
 /// Cap on stored memories per agent — oldest entries are dropped beyond this.
 const MAX_MEMORY_ENTRIES: usize = 500;
@@ -62,12 +90,24 @@ impl BM25Memory {
     }
 
     /// Load from a JSON file, or create empty if file doesn't exist / is invalid.
+    /// An unparseable file is moved aside so a later save can't overwrite it.
     pub fn from_file(name: &str, path: &Path) -> Self {
         let mut mem = Self::new(name);
         if let Ok(data) = std::fs::read_to_string(path) {
-            if let Ok(store) = serde_json::from_str::<MemoryStore>(&data) {
-                for entry in store.entries {
-                    mem.add(&entry.situation, &entry.recommendation);
+            match serde_json::from_str::<MemoryStore>(&data) {
+                Ok(store) => {
+                    for entry in store.entries {
+                        mem.add(&entry.situation, &entry.recommendation);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse memory '{}' at {}: {} — backing up corrupt file",
+                        name,
+                        path.display(),
+                        e
+                    );
+                    backup_corrupt_file(path);
                 }
             }
         }
@@ -88,19 +128,31 @@ impl BM25Memory {
                 .collect(),
         };
         let json = serde_json::to_string_pretty(&store)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, json)?;
+        atomic_write(path, &json)?;
         Ok(())
     }
 
-    /// Tokenize text into words (simple ASCII tokenizer)
+    /// Tokenize text: ASCII words plus CJK character bigrams so Chinese
+    /// summaries/reflections are retrievable.
     fn tokenize(&self, text: &str) -> Vec<String> {
-        WORD_RE
-            .find_iter(text)
-            .map(|m| m.as_str().to_lowercase())
-            .collect()
+        let mut tokens = Vec::new();
+        for m in WORD_RE.find_iter(text) {
+            let s = m.as_str();
+            if s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                tokens.push(s.to_lowercase());
+            } else {
+                // Han run: emit character bigrams (single char if run length 1)
+                let chars: Vec<char> = s.chars().collect();
+                if chars.len() == 1 {
+                    tokens.push(chars[0].to_string());
+                } else {
+                    for w in chars.windows(2) {
+                        tokens.push(w.iter().collect());
+                    }
+                }
+            }
+        }
+        tokens
     }
 
     /// Add a situation and its recommendation to memory
@@ -162,10 +214,17 @@ impl BM25Memory {
             return Vec::new();
         }
 
+        // Only consider documents sharing at least one term with the query —
+        // otherwise unrelated entries get returned as "similar past
+        // situations" whenever nothing really matches. (A plain score > 0
+        // filter is wrong: in small corpora the clamped IDF is ln(1) = 0, so
+        // even genuine matches can score 0.)
+        let query_set: std::collections::HashSet<&String> = query_tokens.iter().collect();
         let mut scores: Vec<(usize, f64)> = self
             .tokenized_docs
             .iter()
             .enumerate()
+            .filter(|(_, doc)| doc.iter().any(|t| query_set.contains(t)))
             .map(|(i, doc)| (i, self.bm25_score(doc, &query_tokens)))
             .collect();
 
@@ -301,13 +360,18 @@ impl DecisionLog {
     }
 
     /// Load from the given path, or create empty if not found.
+    /// An unparseable file is moved aside so a later save can't overwrite it.
     pub fn load(path: &Path, max_resolved_entries: Option<usize>) -> Self {
         let entries = if path.exists() {
             match std::fs::read_to_string(path) {
                 Ok(data) => serde_json::from_str::<DecisionLogStore>(&data)
                     .map(|s| s.entries)
                     .unwrap_or_else(|e| {
-                        tracing::warn!("Failed to parse decision log: {}", e);
+                        tracing::warn!(
+                            "Failed to parse decision log: {} — backing up corrupt file",
+                            e
+                        );
+                        backup_corrupt_file(path);
                         Vec::new()
                     }),
                 Err(e) => {
@@ -326,16 +390,44 @@ impl DecisionLog {
         }
     }
 
-    /// Persist the log to disk.
-    pub fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Merge entries written to disk by another process since we loaded.
+    /// Keyed by (ticker, date): a Resolved copy wins over a Pending one;
+    /// on equal status the in-memory copy wins. Disk-only entries are kept.
+    fn merge_from_disk(&mut self) {
+        let Ok(data) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+        let Ok(store) = serde_json::from_str::<DecisionLogStore>(&data) else {
+            return;
+        };
+        for disk_entry in store.entries {
+            let key = (disk_entry.ticker.to_lowercase(), disk_entry.date.clone());
+            match self
+                .entries
+                .iter_mut()
+                .find(|e| e.ticker.to_lowercase() == key.0 && e.date == key.1)
+            {
+                Some(mem_entry) => {
+                    if mem_entry.status == DecisionStatus::Pending
+                        && disk_entry.status == DecisionStatus::Resolved
+                    {
+                        *mem_entry = disk_entry;
+                    }
+                }
+                None => self.entries.push(disk_entry),
+            }
         }
+    }
+
+    /// Persist the log to disk (atomic write, merging concurrent updates).
+    pub fn save(&mut self) -> anyhow::Result<()> {
+        self.merge_from_disk();
+        self.prune_resolved();
         let store = DecisionLogStore {
             entries: self.entries.clone(),
         };
         let json = serde_json::to_string_pretty(&store)?;
-        std::fs::write(&self.path, json)?;
+        atomic_write(&self.path, &json)?;
         tracing::debug!("Decision log saved to {}", self.path.display());
         Ok(())
     }

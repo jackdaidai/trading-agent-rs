@@ -63,6 +63,9 @@ pub struct Quote {
     pub high: f64,
     pub low: f64,
     pub close: f64,
+    /// Dividend-adjusted close (falls back to `close` when Yahoo omits it).
+    #[serde(default)]
+    pub adjclose: Option<f64>,
     pub volume: i64,
     pub timestamp: i64,
 }
@@ -175,7 +178,10 @@ impl YahooFinanceClient {
         end_date: &str,
     ) -> Result<serde_json::Value> {
         let period1 = Self::date_to_timestamp(start_date)?;
-        let period2 = Self::date_to_timestamp(end_date)?;
+        // period2 is an exclusive upper bound on bar timestamps, and daily bars
+        // are stamped at market open (after midnight UTC for most exchanges).
+        // Add a day so the end_date's own bar is included.
+        let period2 = Self::date_to_timestamp(end_date)? + 86_400;
         if period2 <= period1 {
             anyhow::bail!("end_date must be after start_date");
         }
@@ -235,6 +241,9 @@ impl YahooFinanceClient {
             .and_then(|v| v.as_array())
             .context("No close prices in Yahoo Finance chart response")?;
         let volumes = quote.get("volume").and_then(|v| v.as_array());
+        let adjcloses = result
+            .pointer("/indicators/adjclose/0/adjclose")
+            .and_then(|v| v.as_array());
 
         let mut quotes = Vec::new();
         for (i, ts) in timestamps.iter().enumerate() {
@@ -258,12 +267,15 @@ impl YahooFinanceClient {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
 
+            let adjclose = adjcloses.and_then(|a| a.get(i)).and_then(|v| v.as_f64());
+
             quotes.push(Quote {
                 symbol: symbol.to_uppercase(),
                 open,
                 high,
                 low,
                 close,
+                adjclose,
                 volume,
                 timestamp,
             });
@@ -366,20 +378,35 @@ impl YahooFinanceClient {
                 let _ = self.client.get("https://fc.yahoo.com").send().await;
                 let resp = self
                     .client
-                    .get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+                    .get(self.endpoint("/v1/test/getcrumb"))
                     .header("accept", "text/plain")
                     .send()
                     .await
                     .context("crumb request failed")?;
+                let status = resp.status();
                 let crumb = resp.text().await.context("reading crumb")?;
                 let crumb = crumb.trim().to_string();
-                if crumb.is_empty() || crumb.contains('<') || crumb.len() > 64 {
+                if !status.is_success() {
+                    anyhow::bail!(
+                        "crumb request HTTP {}: {}",
+                        status,
+                        crumb.chars().take(80).collect::<String>()
+                    );
+                }
+                // Error bodies ("Too Many Requests") contain spaces/HTML; a
+                // real crumb is a short single token. Never cache garbage —
+                // OnceCell would pin it for the process lifetime.
+                if crumb.is_empty()
+                    || crumb.contains('<')
+                    || crumb.contains(char::is_whitespace)
+                    || crumb.len() > 64
+                {
                     anyhow::bail!("invalid crumb response");
                 }
                 Ok::<String, anyhow::Error>(crumb)
             })
             .await
-            .map(|s| s.clone())
+            .cloned()
     }
 
     /// Valuation + financial fundamentals via the authenticated quoteSummary
@@ -436,10 +463,16 @@ impl YahooFinanceClient {
         {
             out += &format!("**Company**: {}\n\n", n);
         }
-        if let Some(s) = profile.and_then(|p| p.get("sector")).and_then(|v| v.as_str()) {
+        if let Some(s) = profile
+            .and_then(|p| p.get("sector"))
+            .and_then(|v| v.as_str())
+        {
             out += &format!("**Sector**: {}\n", s);
         }
-        if let Some(i) = profile.and_then(|p| p.get("industry")).and_then(|v| v.as_str()) {
+        if let Some(i) = profile
+            .and_then(|p| p.get("industry"))
+            .and_then(|v| v.as_str())
+        {
             out += &format!("**Industry**: {}\n", i);
         }
 
@@ -723,16 +756,14 @@ impl YahooFinanceClient {
             ticker,
             "contract",
             "customer",
-            "Microsoft",
-            "GPU",
-            "AI",
-            "cloud",
-            "data center",
+            "guidance",
             "revenue",
-            "ARR",
+            "margin",
             "financing",
             "capex",
             "earnings",
+            "outlook",
+            "acquisition",
         ];
         excerpt_around_terms(&text, &terms, NEWS_EXCERPT_CHARS)
     }
@@ -766,8 +797,14 @@ impl YahooFinanceClient {
                 losses.push(diff.abs());
             }
         }
-        let avg_gain: f64 = gains.iter().skip(gains.len() - period).sum::<f64>() / period as f64;
-        let avg_loss: f64 = losses.iter().skip(losses.len() - period).sum::<f64>() / period as f64;
+        // Wilder's RSI: seed with the SMA of the first `period` deltas, then
+        // recursively smooth. Matches TA-Lib / charting-platform values.
+        let mut avg_gain: f64 = gains[..period].iter().sum::<f64>() / period as f64;
+        let mut avg_loss: f64 = losses[..period].iter().sum::<f64>() / period as f64;
+        for i in period..gains.len() {
+            avg_gain = (avg_gain * (period as f64 - 1.0) + gains[i]) / period as f64;
+            avg_loss = (avg_loss * (period as f64 - 1.0) + losses[i]) / period as f64;
+        }
         if avg_loss == 0.0 {
             return Some(100.0);
         }
@@ -881,7 +918,10 @@ fn extract_paragraph_text(html: &str) -> String {
             break;
         };
         let after_tag = &after_open[tag_end + 1..];
-        let lower_after_tag = after_tag.to_lowercase();
+        // ASCII lowercase is byte-length-preserving, so indices found in the
+        // lowered copy are valid in the original (to_lowercase() is not: 'İ'
+        // expands to 2 chars and would shift every later index).
+        let lower_after_tag = after_tag.to_ascii_lowercase();
         let Some(close_index) = lower_after_tag.find("</p>") else {
             break;
         };
@@ -898,7 +938,7 @@ fn extract_paragraph_text(html: &str) -> String {
 }
 
 fn find_paragraph_open(input: &str) -> Option<usize> {
-    let lower = input.to_lowercase();
+    let lower = input.to_ascii_lowercase();
     let mut offset = 0;
 
     while let Some(relative_index) = lower[offset..].find("<p") {
@@ -962,14 +1002,14 @@ fn remove_html_block(input: impl AsRef<str>, tag: &str) -> String {
     let close = format!("</{}>", tag);
 
     loop {
-        let lower = remaining.to_lowercase();
+        let lower = remaining.to_ascii_lowercase();
         let Some(start) = lower.find(&open) else {
             output.push_str(remaining);
             break;
         };
         output.push_str(&remaining[..start]);
         let after_start = &remaining[start..];
-        let lower_after = after_start.to_lowercase();
+        let lower_after = after_start.to_ascii_lowercase();
         if let Some(end) = lower_after.find(&close) {
             remaining = &after_start[end + close.len()..];
         } else {
@@ -1117,6 +1157,7 @@ pub async fn execute_tool(
             let look_back = args
                 .get("look_back_days")
                 .and_then(|v| v.as_i64())
+                .map(|v| v.clamp(1, 3650))
                 .unwrap_or(90) as i32;
             client.get_indicators(symbol, curr_date, look_back).await
         }
@@ -1333,9 +1374,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(news.contains("Microsoft"));
-        assert!(news.contains("US$9.70") || news.contains("9.70"));
-        assert!(news.contains("B300") || news.contains("50,000"));
+        // Assert the excerpt mechanism works, not what any specific article
+        // said on a given day (Yahoo's result set drifts over time).
+        assert!(news.contains("Recent News"));
+        assert!(
+            news.contains("Article excerpt:"),
+            "no article excerpts extracted:\n{news}"
+        );
+        let has_financial_substance = ["contract", "revenue", "earnings", "$"]
+            .iter()
+            .any(|t| news.to_lowercase().contains(&t.to_lowercase()));
+        assert!(
+            has_financial_substance,
+            "excerpts lack financial substance:\n{news}"
+        );
     }
 
     #[test]
