@@ -267,7 +267,9 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
     } = resolve_run_request(
         args.tickers,
         args.date,
-        chrono::Local::now().format("%Y-%m-%d").to_string(),
+        // UTC to match the resolve loop's clock (is_resolvable measures age
+        // against Utc::now), avoiding an off-by-one on the horizon.
+        chrono::Utc::now().format("%Y-%m-%d").to_string(),
     )?;
 
     tracing::info!("Tickers: {:?}, Date: {}", tickers, trade_date);
@@ -288,9 +290,10 @@ async fn run_analysis(args: RunArgs) -> Result<()> {
             let yf = yf.clone();
             let t = t.clone();
             validates.push(tokio::spawn(async move {
-                // Use recent 5-day window for validation
+                // 14-day window: long exchange holidays (Lunar New Year,
+                // Golden Week) can leave >5 calendar days with no bars.
                 let today = chrono::Utc::now().date_naive();
-                let start = (today - chrono::Duration::days(5))
+                let start = (today - chrono::Duration::days(14))
                     .format("%Y-%m-%d")
                     .to_string();
                 let end = today.format("%Y-%m-%d").to_string();

@@ -185,9 +185,13 @@ fn is_resolvable(entry_date: &str, today: NaiveDate, horizon_days: i64) -> bool 
 }
 
 /// Percent change from the first to the last close in the window.
+/// Uses the dividend-adjusted close when available so total return
+/// (and thus alpha) includes dividends paid during the window.
 fn window_return(quotes: &[Quote]) -> Option<f64> {
-    let first = quotes.first()?.close;
-    let last = quotes.last()?.close;
+    let first_q = quotes.first()?;
+    let last_q = quotes.last()?;
+    let first = first_q.adjclose.unwrap_or(first_q.close);
+    let last = last_q.adjclose.unwrap_or(last_q.close);
     if first == 0.0 {
         return None;
     }
@@ -226,6 +230,7 @@ mod tests {
             high: close,
             low: close,
             close,
+            adjclose: None,
             volume: 0,
             timestamp: 0,
         }

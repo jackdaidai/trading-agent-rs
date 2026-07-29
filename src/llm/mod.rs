@@ -163,6 +163,14 @@ async fn retry_request(
 
         let resp = match resp {
             Ok(r) => r,
+            // A client-side timeout means the model needed longer than the
+            // configured limit — re-sending the same request will time out
+            // again and multiply latency and token billing. Fail fast.
+            Err(e) if e.is_timeout() => {
+                return Err(e).context(
+                    "LLM request timed out; raise TRADING_AGENT_LLM_TIMEOUT if the model legitimately needs longer",
+                );
+            }
             Err(e) if attempt < MAX_RETRIES => {
                 drop(permit);
                 let delay = BASE_DELAY_MS * 2u64.pow(attempt);
@@ -194,7 +202,13 @@ async fn retry_request(
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 continue;
             }
-            bail!("HTTP {} after {} retries", status, MAX_RETRIES);
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "HTTP {} after {} retries: {}",
+                status,
+                MAX_RETRIES,
+                body.chars().take(300).collect::<String>()
+            );
         }
 
         if !status.is_success() {
@@ -450,7 +464,8 @@ impl LLMClient for OpenAIClient {
     async fn complete_with_tools(&self, prompt: &str, tools: &[Tool]) -> Result<LLMResponse> {
         let mut body = json!({
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}]
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": llm_max_tokens()
         });
 
         // Add tool definitions if provided

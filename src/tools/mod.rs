@@ -90,7 +90,7 @@ pub fn get_all_tools() -> Vec<Tool> {
         // Financials (company overview)
         Tool {
             name: "get_financials".to_string(),
-            description: "Get company overview data: current price, 52-week range, company name, sector, industry. Detailed financial statements (balance sheet, cash flow, income statement) are not available.".to_string(),
+            description: "Get company fundamentals: current price, market cap, P/E, EPS, margins, revenue, free cash flow, debt, analyst targets, sector, industry, 52-week range. Falls back to a basic overview (price/range/name only) if the authenticated endpoint is unavailable. Full statement line items (balance sheet, cash flow, income statement) are not available.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

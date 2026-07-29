@@ -193,7 +193,7 @@ impl GraphEngine {
             return prompt.to_string();
         }
         format!(
-            "{prompt}\n\n=== OUTPUT LANGUAGE (MANDATORY) ===\nWrite your ENTIRE response in {lang}. Every heading, sentence, the Rating line, and all section titles MUST be in {lang}. Keep ticker symbols, numbers, prices, and currency symbols unchanged. Do not switch to English."
+            "{prompt}\n\n=== OUTPUT LANGUAGE (MANDATORY) ===\nWrite your ENTIRE response in {lang}. Every heading, sentence, and all section titles MUST be in {lang}. Keep ticker symbols, numbers, prices, and currency symbols unchanged. Do not switch to English.\nEXCEPTION: machine-readable sentinel lines must stay in English exactly as specified in the prompt — in particular a final line like `FINAL RATING: **BUY**` (BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL) and the `confidence: High/Medium/Low` marker. You may add a {lang} translation after them, but the English sentinel line itself is required."
         )
     }
 
@@ -293,7 +293,8 @@ impl GraphEngine {
             self.tool_registry.get_by_name(ToolName::GetIndicators),
         ];
 
-        self.execute_llm_with_tools(&prompt, &tools).await
+        self.execute_llm_with_tools(&self.with_lang(&prompt), &tools)
+            .await
     }
 
     async fn run_social_analyst(&self, ticker: &str, date: &str) -> Result<String> {
@@ -325,7 +326,8 @@ impl GraphEngine {
 
         let tools = vec![self.tool_registry.get_by_name(ToolName::GetNews)];
 
-        self.execute_llm_with_tools(&prompt, &tools).await
+        self.execute_llm_with_tools(&self.with_lang(&prompt), &tools)
+            .await
     }
 
     async fn run_news_analyst(&self, ticker: &str, date: &str) -> Result<String> {
@@ -370,7 +372,8 @@ impl GraphEngine {
             self.tool_registry.get_by_name(ToolName::GetGlobalNews),
         ];
 
-        self.execute_llm_with_tools(&prompt, &tools).await
+        self.execute_llm_with_tools(&self.with_lang(&prompt), &tools)
+            .await
     }
 
     async fn run_fundamentals_analyst(&self, ticker: &str, date: &str) -> Result<String> {
@@ -406,7 +409,8 @@ impl GraphEngine {
 
         let tools = vec![self.tool_registry.get_by_name(ToolName::GetFinancials)];
 
-        self.execute_llm_with_tools(&prompt, &tools).await
+        self.execute_llm_with_tools(&self.with_lang(&prompt), &tools)
+            .await
     }
 
     // -------------------------------------------------------------------------
@@ -510,9 +514,11 @@ impl GraphEngine {
                 },
             );
 
+            let bull_prompt_lang = self.with_lang(&bull_prompt);
+            let bear_prompt_lang = self.with_lang(&bear_prompt);
             let (bull_response, bear_response) = tokio::try_join!(
-                self.llm_quick.complete(&bull_prompt),
-                self.llm_quick.complete(&bear_prompt),
+                self.llm_quick.complete(&bull_prompt_lang),
+                self.llm_quick.complete(&bear_prompt_lang),
             )?;
 
             debate_state
@@ -522,7 +528,7 @@ impl GraphEngine {
                 .bear_history
                 .push_str(&format!("\nBear: {}", bear_response));
             debate_state.history.push_str(&format!(
-                "Round {} Bull: {} Bear: {}",
+                "\nRound {}:\nBull: {}\nBear: {}\n",
                 round + 1,
                 bull_response,
                 bear_response
@@ -639,11 +645,17 @@ impl GraphEngine {
         for round in 0..max_rounds {
             tracing::info!("Risk debate round {}", round + 1);
 
+            let prior = if risk_state.history.is_empty() {
+                String::new()
+            } else {
+                format!("Prior debate rounds:\n{}\n\nRespond to the other analysts' points above; do not repeat yourself.", risk_state.history)
+            };
+
             // Run all 3 risk analysts in parallel
             let (agg_result, cons_result, neut_result) = tokio::join!(
-                self.run_aggressive_risk(state),
-                self.run_conservative_risk(state),
-                self.run_neutral_risk(state),
+                self.run_aggressive_risk(state, &prior),
+                self.run_conservative_risk(state, &prior),
+                self.run_neutral_risk(state, &prior),
             );
 
             // Extract string values before ? moves them
@@ -678,7 +690,7 @@ impl GraphEngine {
         Ok(())
     }
 
-    async fn run_aggressive_risk(&self, state: &AgentState) -> Result<String> {
+    async fn run_aggressive_risk(&self, state: &AgentState, prior: &str) -> Result<String> {
         let prompt = format!(
             r#"You are an aggressive risk analyst championing high-risk, high-reward strategies.
 
@@ -692,6 +704,8 @@ impl GraphEngine {
             {evidence_discipline}
 
             {decision_calibration}
+
+            {prior}
 
             Provide your aggressive risk assessment:
             - Maximizing upside scenarios
@@ -711,7 +725,7 @@ impl GraphEngine {
         self.llm_quick.complete(&self.with_lang(&prompt)).await
     }
 
-    async fn run_conservative_risk(&self, state: &AgentState) -> Result<String> {
+    async fn run_conservative_risk(&self, state: &AgentState, prior: &str) -> Result<String> {
         let prompt = format!(
             r#"You are a conservative risk analyst focused on protecting capital.
 
@@ -725,6 +739,8 @@ impl GraphEngine {
             {evidence_discipline}
 
             {decision_calibration}
+
+            {prior}
 
             Provide your conservative risk assessment:
             - Downside protection
@@ -744,7 +760,7 @@ impl GraphEngine {
         self.llm_quick.complete(&self.with_lang(&prompt)).await
     }
 
-    async fn run_neutral_risk(&self, state: &AgentState) -> Result<String> {
+    async fn run_neutral_risk(&self, state: &AgentState, prior: &str) -> Result<String> {
         let prompt = format!(
             r#"You are a neutral risk analyst balancing risk and reward.
 
@@ -758,6 +774,8 @@ impl GraphEngine {
             {evidence_discipline}
 
             {decision_calibration}
+
+            {prior}
 
             Provide your balanced risk assessment:
             - Weighing upside potential vs downside risk
@@ -962,7 +980,12 @@ impl GraphEngine {
                 "Tool budget exhausted. Do not request any more tools; write your final analysis now using the data gathered so far.".to_string(),
             )],
         });
-        let final_response = self.llm_quick.complete_messages(messages, tools).await?;
+        // No tools on the final call: the model can't answer with a bare
+        // tool_use block, so content can't come back empty.
+        let final_response = self.llm_quick.complete_messages(messages, &[]).await?;
+        if final_response.content.trim().is_empty() {
+            anyhow::bail!("LLM returned empty content after tool budget exhausted");
+        }
         Ok(final_response.content)
     }
 }
@@ -1041,19 +1064,41 @@ fn extract_rating_and_confidence(text: &str) -> (String, String) {
         Regex::new(r"(?i)FINAL\s+RATING:\s*\*{0,2}(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\*{0,2}")
             .unwrap()
     });
+    // Fallback for localized output: `最终评级：**买入**` etc.
+    static RATING_ZH_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:最终评级|最終評級)[:：]\s*\*{0,2}(买入|買入|增持|持有|减持|減持|卖出|賣出)\*{0,2}")
+            .unwrap()
+    });
     static CONFIDENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)confidence(?:\s+level)?[:\s]+\*{0,2}(High|Medium|Low)\*{0,2}").unwrap()
+        // Both orders: "confidence: High" and "with high confidence".
+        Regex::new(r"(?i)confidence(?:\s+level)?[:\s]+\*{0,2}(High|Medium|Low)\*{0,2}|\*{0,2}(High|Medium|Low)\*{0,2}\s+confidence")
+            .unwrap()
+    });
+    static CONFIDENCE_ZH_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:信心|置信|信心水平|置信度)[:：]?\s*\*{0,2}(高|中|低)\*{0,2}").unwrap()
     });
 
     let rating = RATING_RE
         .captures(text)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_uppercase())
+        .or_else(|| {
+            RATING_ZH_RE.captures(text).and_then(|c| c.get(1)).map(|m| {
+                match m.as_str() {
+                    "买入" | "買入" => "BUY",
+                    "增持" => "OVERWEIGHT",
+                    "持有" => "HOLD",
+                    "减持" | "減持" => "UNDERWEIGHT",
+                    _ => "SELL",
+                }
+                .to_string()
+            })
+        })
         .unwrap_or_else(|| "UNKNOWN".to_string());
 
     let confidence = CONFIDENCE_RE
         .captures(text)
-        .and_then(|c| c.get(1))
+        .and_then(|c| c.get(1).or_else(|| c.get(2)))
         .map(|m| {
             let s = m.as_str();
             let mut c = s.chars();
@@ -1061,6 +1106,19 @@ fn extract_rating_and_confidence(text: &str) -> (String, String) {
                 Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
                 None => s.to_string(),
             }
+        })
+        .or_else(|| {
+            CONFIDENCE_ZH_RE
+                .captures(text)
+                .and_then(|c| c.get(1))
+                .map(|m| {
+                    match m.as_str() {
+                        "高" => "High",
+                        "中" => "Medium",
+                        _ => "Low",
+                    }
+                    .to_string()
+                })
         })
         .unwrap_or_else(|| "Unknown".to_string());
 
