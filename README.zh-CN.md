@@ -44,7 +44,7 @@ trading-agent-rs 使用固定研究流程：
 ### 设置
 
 ```powershell
-git clone <repo-url>
+git clone https://github.com/jackdaidai/trading-agent-rs.git
 cd trading-agent-rs
 
 Copy-Item .env.example .env
@@ -185,8 +185,8 @@ trading-agent-rs 有意从比上游 Python 项目更小的范围开始。当前�
 | --- | --- | --- |
 | 交互式 CLI | 非交互式 CLI，提供 `clap` 帮助和子命令 | 如果需求明确，增加更丰富的引导式提示 |
 | Docker | 尚未打包 | 添加 `Dockerfile` 和 compose 示例 |
-| 本地模型 | 尚未接入 Ollama | 添加 Ollama/OpenAI-compatible 本地配置 |
-| Provider 覆盖 | MiniMax、Z.ai、OpenAI-compatible、Anthropic-compatible | 考虑 Gemini、DeepSeek、Qwen、OpenRouter、Azure 和 Bedrock |
+| 本地模型 | 已可通过 OpenAI 兼容路径使用：把 base URL 指向你的 Ollama 端点（如 `http://localhost:11434/v1`） | 补充专门的本地模型配置文档 |
+| Provider 覆盖 | MiniMax、Z.ai、Anthropic-compatible，以及任意 OpenAI-compatible 端点（DeepSeek、OpenRouter、Ollama 等通过 base URL 覆盖即可使用） | 考虑原生 Gemini、Azure 和 Bedrock 认证配置 |
 | 持久化 | 决策日志和 BM25 Agent 记忆持久化在 `~/.trading-agent-rs/` 下；`resolve` 子命令对过往决策打分并记录经验 | 对已结算决策做更丰富的结果分析 |
 | 断点续跑 | 尚未实现 | 为中断的长任务添加可恢复图执行 |
 | Benchmark | 已记录性能目标，但未发布 benchmark 结果 | 添加可复现的多股票 benchmark 脚本和结果 |

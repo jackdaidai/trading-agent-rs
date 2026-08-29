@@ -44,7 +44,7 @@ trading-agent-rs runs a fixed research pipeline:
 ### Setup
 
 ```powershell
-git clone <repo-url>
+git clone https://github.com/jackdaidai/trading-agent-rs.git
 cd trading-agent-rs
 
 Copy-Item .env.example .env
@@ -185,8 +185,8 @@ trading-agent-rs intentionally starts smaller than the upstream Python project. 
 | --- | --- | --- |
 | Interactive CLI | Non-interactive CLI with `clap` help and subcommands | Add richer guided prompts if demand is clear |
 | Docker | Not packaged yet | Add `Dockerfile` and compose examples |
-| Local models | Not wired to Ollama yet | Add an Ollama/OpenAI-compatible local profile |
-| Provider coverage | MiniMax, Z.ai, OpenAI-compatible, Anthropic-compatible | Consider Gemini, DeepSeek, Qwen, OpenRouter, Azure, and Bedrock |
+| Local models | Usable via the OpenAI-compatible path: point the base URL at your Ollama endpoint (e.g. `http://localhost:11434/v1`) | Document a dedicated local-model profile |
+| Provider coverage | MiniMax, Z.ai, Anthropic-compatible, and any OpenAI-compatible endpoint (DeepSeek, OpenRouter, Ollama, etc. work via the base URL override) | Consider native Gemini, Azure, and Bedrock auth profiles |
 | Persistence | Decision log and BM25 agent memories persist under `~/.trading-agent-rs/`; `resolve` scores past decisions and records lessons | Richer outcome analytics across resolved decisions |
 | Checkpoint resume | Not implemented | Add resumable graph execution for interrupted long runs |
 | Benchmarks | Performance goal is documented, but benchmark results are not published | Add repeatable multi-ticker benchmark scripts and results |
