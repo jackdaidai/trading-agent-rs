@@ -20,6 +20,14 @@ benchmark-*.txt
 # Local scratch helpers
 inspect_git.py
 
+# Machine-specific Windows setup/build helpers (kept locally, not published)
+/scripts/add_exclusion.ps1
+/scripts/setup_applocker.ps1
+/scripts/applocker_rustup.xml
+/scripts/lld-link-wrapper.bat
+/scripts/lld-link-wrapper.sh
+/scripts/lld-wrapper.sh
+
 # Editor and OS files
 .vscode/
 .idea/

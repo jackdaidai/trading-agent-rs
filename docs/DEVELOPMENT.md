@@ -39,4 +39,4 @@ Live Yahoo Finance coverage belongs behind ignored smoke tests because endpoints
 
 ## Helper scripts
 
-The PowerShell, batch, and linker-wrapper files under `scripts\` are Windows development helpers (AppLocker/Defender exclusions, MSVC environment wrappers). Treat them as local build-environment support, not release artifacts.
+`scripts\` contains Windows development helpers (a Defender exclusion for the build directory, MSVC environment wrappers). Treat them as local build-environment support, not release artifacts. Machine-specific setup scripts are intentionally not tracked in the repository.

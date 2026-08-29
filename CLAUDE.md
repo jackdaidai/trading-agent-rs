@@ -1,18 +1,28 @@
+# CLAUDE.md
 
-## Skill routing
+Guidance for AI coding agents (Claude Code, etc.) working in this repository.
 
-When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+## Project overview
 
-Key routing rules:
-- Product ideas/brainstorming -> invoke /office-hours
-- Strategy/scope -> invoke /plan-ceo-review
-- Architecture -> invoke /plan-eng-review
-- Design system/plan review -> invoke /design-consultation or /plan-design-review
-- Full review pipeline -> invoke /autoplan
-- Bugs/errors -> invoke /investigate
-- QA/testing site behavior -> invoke /qa or /qa-only
-- Code review/diff check -> invoke /review
-- Visual polish -> invoke /design-review
-- Ship/deploy/PR -> invoke /ship or /land-and-deploy
-- Save progress -> invoke /context-save
-- Resume context -> invoke /context-restore
+trading-agent-rs is a Rust-native AI stock analysis agent: a multi-agent
+analyst/debate/trader/risk pipeline that produces Markdown research reports.
+See `docs/ARCHITECTURE.md` for the pipeline design.
+
+## Commands
+
+- Build: `cargo build`
+- Format: `cargo fmt --check` (CI enforces this)
+- Lint: `cargo clippy --all-targets -- -D warnings` (CI treats warnings as errors)
+- Tests: `cargo test --all-targets` and `cargo test --doc`
+
+All four checks must pass before pushing; CI runs them on Windows and Ubuntu.
+
+## Conventions
+
+- MSRV is 1.80; `Cargo.lock` is committed intentionally.
+- API keys come from `.env` / environment variables only. Never hardcode them,
+  log them, or commit generated reports.
+- Prefer tests with mock provider responses over tests that hit paid LLM APIs
+  (see `docs/DEVELOPMENT.md`).
+- Generated outputs (`reports/`, `tagent-results/`, `batch-*.txt`) are
+  gitignored; do not commit them.
