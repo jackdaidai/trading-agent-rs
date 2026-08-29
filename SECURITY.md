@@ -6,7 +6,11 @@ Security fixes are handled on the default branch until the project publishes for
 
 ## Reporting a vulnerability
 
-Please report security issues privately to the project maintainer instead of opening a public issue. Include enough detail to reproduce or understand the issue, but do not include live API keys, private account data, or non-public trading information.
+Please report security issues privately via GitHub's private vulnerability reporting instead of opening a public issue:
+
+https://github.com/jackdaidai/trading-agent-rs/security/advisories/new
+
+Include enough detail to reproduce or understand the issue, but do not include live API keys, private account data, or non-public trading information.
 
 Relevant security issues include:
 
